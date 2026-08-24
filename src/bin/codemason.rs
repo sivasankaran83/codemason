@@ -3,6 +3,8 @@ use std::time::Instant;
 use codemason_core::cli::{self, ExitCode, RunArgs, API_KEY_ENV, BASE_URL_ENV};
 use codemason_core::log::{event_type, EventLog};
 use codemason_core::report::{finish, IndexReport, RunReport, TotalsReport};
+use codemason_core::partition::{self, PartitionOptions};
+use codemason_core::text::normalize_slashes;
 use codemason_core::{config, gating, llm, repo, Error, Index, LoopConfig, LoopExit};
 use uuid::Uuid;
 
@@ -365,6 +367,103 @@ fn index_cmd(sub: &clap::ArgMatches) -> ExitCode {
         println!("build_ms: {}", stats.build_ms);
         for (language, count) in &stats.languages {
             println!("  {language}: {count}");
+        }
+    }
+
+    if sub.get_flag("graph") {
+        // Only the edges an orchestrator partitions on. The engine's
+        // `FileNode` also carries symbols and raw imports; emitting those
+        // would multiply the payload for data no partitioner reads, and this
+        // is written for repositories large enough that the difference
+        // matters.
+        let graph = index.graph();
+        let mut files = serde_json::Map::new();
+        for path in graph.all_files() {
+            let depends_on: Vec<&str> = graph
+                .deps(&path)
+                .map(|node| node.depends_on.iter().map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            let dependents = graph.dependents(&path);
+            files.insert(
+                normalize_slashes(&path),
+                serde_json::json!({
+                    "depends_on": depends_on.iter().map(|p| normalize_slashes(p)).collect::<Vec<_>>(),
+                    // Pre-computed because in-degree is what decides which
+                    // files must never be co-scheduled, and every consumer
+                    // would otherwise invert the edge set to get it.
+                    "dependent_count": dependents.len(),
+                }),
+            );
+        }
+
+        let payload = serde_json::json!({
+            "repo": normalize_slashes(&repo.to_string()),
+            "file_count": graph.file_count(),
+            "edge_count": graph.edge_count(),
+            "files": files,
+        });
+        let line = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+        if let Err(err) = codemason_core::text::write_stdout(&format!("{line}\n")) {
+            eprintln!("error: could not write graph: {err}");
+            return ExitCode::UnrecoverableError;
+        }
+    }
+
+    if sub.get_flag("partition") {
+        let opts = PartitionOptions {
+            hub_ratio: sub
+                .get_one::<String>("hub-ratio")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(PartitionOptions::default().hub_ratio),
+            ..PartitionOptions::default()
+        };
+        let result = partition::partition(index.graph(), opts);
+
+        if sub.get_flag("json") {
+            let line = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string());
+            if let Err(err) = codemason_core::text::write_stdout(&format!("{line}\n")) {
+                eprintln!("error: could not write partitions: {err}");
+                return ExitCode::UnrecoverableError;
+            }
+        } else {
+            let s = &result.stats;
+            println!(
+                "files {}  edges {}  ->  {} parallel partition(s) + {} hub(s)",
+                s.files, s.edges, s.component_partitions, s.hub_partitions
+            );
+            println!();
+            if s.degrades_to_sequential {
+                println!("DEGRADES TO SEQUENTIAL: too densely coupled to split usefully.");
+                println!("Run it as a single job. Per ORCHESTRATION.md this is a correct");
+                println!("outcome, not a failure -- naive parallelism on coupled code");
+                println!("measures worse than not parallelising at all.");
+                println!();
+            }
+            for p in &result.partitions {
+                if p.kind == "hub" {
+                    println!(
+                        "  {:>4}  HUB   {}  ({} dependents)",
+                        p.id,
+                        p.files[0],
+                        p.dependent_count.unwrap_or(0)
+                    );
+                } else {
+                    let head: Vec<&str> = p
+                        .files
+                        .iter()
+                        .take(4)
+                        .map(|f| f.rsplit('/').next().unwrap_or(f))
+                        .collect();
+                    let more = if p.file_count > 4 {
+                        format!(" +{} more", p.file_count - 4)
+                    } else {
+                        String::new()
+                    };
+                    println!("  {:>4}  [{:>3}] {}{}", p.id, p.file_count, head.join(", "), more);
+                }
+            }
+            println!();
+            println!("Hubs are single-file partitions: editable, never by two jobs at once.");
         }
     }
 

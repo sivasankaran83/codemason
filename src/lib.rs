@@ -8,6 +8,7 @@ pub mod llm;
 #[path = "loop.rs"]
 pub mod r#loop;
 pub mod log;
+pub mod partition;
 pub mod report;
 pub mod repo;
 pub mod text;

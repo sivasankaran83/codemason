@@ -102,10 +102,24 @@ Algorithm:
    together.
 5. Consolidate hub-adjacent leftovers into a single integration group.
 
+Implemented as `codemason index --repo <PATH> --partition [--json]`
+(`--hub-ratio` tunes step 3, default `0.10`).
+
+It lives in the binary rather than in a sidecar script in another language.
+The deploy target is a container carrying `git` and nothing else, so a Python
+or Node partitioner would not run there; "single self-contained binary" is a
+constraint this project holds itself to, and the graph is already in memory in
+Rust, so serialising it out and back would be work done to no end.
+
 **MVP simplification:** skip Infomap community detection. Use connected
 components plus the in-degree singleton isolation in step 3. That is where
 most of the benefit is, at a fraction of the code. Add real community
 detection only if measurement says the partitions are too coarse.
+
+One deliberate detail: edges *through* a hub are dropped when building
+adjacency. Two files related only because both import a shared types module
+are not coupled to each other, and treating them as coupled collapses the
+whole repository into a single partition.
 
 **Degrade to sequential, deliberately.** If partitioning yields one group, the
 repository is too densely coupled to parallelise. Run it as a single
@@ -265,13 +279,20 @@ exactly on a real run.
 
 ## Build order
 
-1. `--graph` export, plus a partitioner that reads it and **prints proposed
-   partitions**. Runnable against real repositories before any agent is
-   dispatched, so the partitioning can be judged on its own.
+1. ~~`--graph` export and a partitioner that prints proposed partitions.~~
+   **Done** — `codemason index --repo <PATH> --graph` and
+   `--partition [--json]`.
 2. Executor: one level, N concurrent `codemason run --worktree`, collect JSON.
 3. Integrator: merge, run tests, apply the decision rule above.
 4. Planner: specification to DAG. Deliberately last — it is the least certain
    part, and the three stages below it are useful without it.
+
+A first Claude Code front-end over stages 2–4 lives in `.claude/`:
+`skills/codemason-orchestrate` (entry point and the rules), the
+`codemason-planner` subagent (stage 3), and the `codemason-build` workflow
+(stages 4–5 fan-out and integration). It is one front-end over the binary, not
+the design — anything that can run a process and read JSON can drive the same
+stages.
 
 Start with **multi-repo microservices**, not monorepo sections. Service
 boundaries are already the cohesion partition, which means stage 2 is nearly

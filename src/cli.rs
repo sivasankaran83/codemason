@@ -132,6 +132,33 @@ fn index_command() -> Command {
                 .long("stats")
                 .action(ArgAction::SetTrue),
         )
+        // Emits the dependency graph the engine already builds, as JSON on
+        // stdout, for an orchestrator to partition on. This is an
+        // operator-facing subcommand flag, not a model-facing tool: the tool
+        // cap in SPEC.md governs what the model sees and is untouched by it.
+        .arg(
+            Arg::new("graph")
+                .long("graph")
+                .action(ArgAction::SetTrue),
+        )
+        // Stage 2 of ORCHESTRATION.md. Derived from the same index, so it
+        // belongs to `index` rather than to a fourth subcommand.
+        .arg(
+            Arg::new("partition")
+                .long("partition")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("hub-ratio")
+                .long("hub-ratio")
+                .value_name("F")
+                .default_value("0.10"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue),
+        )
 }
 
 #[derive(Debug, Clone)]
