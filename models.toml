@@ -1,0 +1,22 @@
+# Placeholder ids. Real ids MUST be validated with `codemason models --check`
+# before use — this file is not fetched or trusted blindly. The first
+# [[model]] entry is the default used when `codemason run` is given no
+# --model flag.
+
+[[model]]
+id = "REPLACE_ME/example-primary-model"
+role = "primary"
+
+[[model]]
+id = "REPLACE_ME/example-fallback-model"
+role = "fallback"
+
+[gating]
+min_context_length = 32000
+require_tool_support = true
+allow_unlisted = false
+# Extends the built-in router/auto-select denylist (exact id
+# "openrouter/auto", ids ending "/auto", ids containing "auto-router") with
+# extra substrings to reject, for providers with their own routing
+# conventions.
+deny_id_patterns = []

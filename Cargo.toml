@@ -55,6 +55,12 @@ tree-sitter-swift = "=0.7.3"
 tree-sitter-typescript = "=0.23.2"
 model2vec-rs = "=0.2.1"
 ndarray = "=0.15.6"
+clap = "=4.6.6"
+toml = "=1.1.4"
+ureq = { version = "=2.12.1", default-features = false, features = ["json", "tls"] }
+
+[dev-dependencies]
+dirs = "=6.0.0"
 
 [profile.release]
 opt-level = 3

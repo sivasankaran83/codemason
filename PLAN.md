@@ -1,273 +1,294 @@
-# PLAN.md — WP1: Harvest the engine
+# PLAN.md — WP2: CLI, configuration, model gating
 
 ## Scope (restated)
 
-Stand up the codemason cargo project and vendor the supplied AST search
-engine into it unmodified. Three tasks:
+Everything that must be correct before a single token is spent. Three tasks:
 
-- **T1.1** Project skeleton: `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`,
-  `README.md` (README already exists at repo root — leave it, it already
-  documents WP1's shape).
-- **T1.2** Lift the engine verbatim into `src/engine/`, write a thin
-  `src/lib.rs` re-exporting its declared public surface, write
-  `src/error.rs` defining `codemason_core::Error` with no reference to any
-  external crate's error/exit-code type, carry `ORIGIN.md` and the licence
-  file.
-- **T1.3** `src/index.rs`: a thin wrapper over the engine's index
-  constructor called with `encoder: None`, exposing build/search/chunks/
-  graph/stats, timing the build into the stats struct, and returning a
-  named-feature error (not a panic) for the embedding-only similarity call
-  when the `embeddings` feature is off.
+- **T2.1** CLI surface, `clap` **builder API** (not `derive`) — three
+  subcommands: `run` (with `--repo`, `--task`, `--model`, `--models-config`,
+  `--base-url`, `--api-key`, `--budget-tokens`, `--budget-usd`,
+  `--max-iterations`, `--branch`, `--log`, `--dry-run`,
+  `--allow-unlisted-model`, `--verbose`), `models [--check]`, and
+  `index --repo <PATH> [--stats]`. Six exit codes (0/1/2/3/4/5) as a stable
+  contract.
+- **T2.2** Allowlist: parse `models.toml` (`[[model]]` tables with `id` +
+  `role`, plus `[gating]`), resolve it from `--models-config` → `./models.toml`
+  → platform config dir, first entry is the default model.
+- **T2.3** Capability gate: fetch the provider's live model catalogue, reject
+  (exit 4) an id that's absent from it, lacks `tools` in
+  `supported_parameters`, is under the configured minimum context length, or
+  is a router/auto-select pseudo-model. Cache the catalogue fetch 24h so
+  concurrent processes don't each hit the network. `--allow-unlisted-model`
+  has a narrow, specific bypass scope (below).
 
-Everything downstream (CLI, gating, tools, loop) is later work packages.
-WP1 produces a crate that builds and searches; it has no `main` behaviour
-beyond what's needed to prove the engine works.
+WP3 (the LLM client and the tool-calling loop) does not exist yet. `run` in
+this package parses and validates everything up to the point a completion
+call would be made, then stops — it does not build the index, does not call
+the model, and `--dry-run`/`--budget-*`/`--branch`/`--log` are accepted and
+stored but have no effect until WP3/WP4 exist to act on them.
 
 ## Feasibility findings
 
-The engine source is not in this repository. Per your message, it lives at
-`old_source/navex-harness-main/harness/crates/lib/context/src/engine/`
-inside a sibling project (`navex-harness`, a different Rust CLI by the same
-author). That folder is a **reference only** — nothing under `old_source/`
-is committed, staged, or depended on by path; it is not part of this crate's
-build. I copy its `engine/` subtree byte-for-byte into `src/engine/` and
-never touch `old_source/` again after that copy.
+Named files from T2.1–T2.3 (`src/cli.rs`, `src/config.rs`, `models.toml`,
+`src/gating.rs`) don't exist yet — expected, this package creates them.
+`src/bin/codemason.rs` exists as WP1's placeholder `fn main() {}`.
 
-Every claim in SPEC.md's Current State section checks out against that
-source:
+Symbols WP2 depends on from WP1 all resolve as documented:
+`codemason_core::Index::{build, search, chunks, graph, stats}` and
+`BuildStats{indexed_files, total_chunks, languages, build_ms}` are `pub` in
+`src/index.rs`, backed by `engine::SembleIndex::{from_path, search, stats,
+chunks, graph}` in `src/engine/index/mod.rs` (confirmed by direct grep, not
+assumed). `codemason index --repo . --stats` (AC2) needs nothing new from the
+engine.
 
-| Claim | Verified |
-|---|---|
-| Zero `use crate::` refs outside `engine/` | Confirmed — every `use crate::` inside `engine/` resolves to `crate::engine::...`; none reach the parent crate. |
-| Only 3 external `ExitCode` uses, all outside `engine/` | Confirmed — `src/error.rs` (parent crate, not vendored) has exactly three production call sites (`MissingPrerequisite`, `Failure` x2); `engine/` has none. |
-| Encoder already `Option<StaticEncoder>` in index modules | Confirmed — `index/mod.rs` and `index/create.rs` both thread it as `Option<&StaticEncoder>` / `Option<StaticEncoder>`. |
-| CLI entry point already stripped | Confirmed — no `fn main`/`clap::` in `engine/`; the two grep hits were a test fixture string and a heuristic string-prefix check, not real entry points. |
-| No persistence: `Serialize` but not `Deserialize` on chunk types | Confirmed — `types.rs` derives `serde::Serialize` only on `Chunk`, `MatchLine`, `SearchResult`, `IndexStats`. |
-| Public surface: `DependencyGraph`, index type, `Chunk`, `IndexStats`, `SearchResult`, plus `search`/`outline`/`plan`/`digest` modules | Confirmed — `engine/mod.rs` declares exactly this (index type is named `SembleIndex`). |
-| ~7,900 lines / 19 modules | Measured 7,855 lines across the 19 `.rs` files under `engine/` — matches "roughly". |
+Dependency-tree check for the new crates this package needs: `Cargo.lock`
+already carries `clap` (4.6.6) and `ureq` (2.12.1) as *transitive* deps of
+`model2vec-rs` (WP1's always-compiled embeddings backend, per WP1's Cargo.toml
+comment), and `rustls` is present with no `native-tls`, `openssl-sys`,
+`git2`, `tokio`, or `async-std` anywhere in the tree. That means promoting
+`clap` and `ureq` to direct dependencies at those same pinned versions won't
+introduce a new major version or drag in anything the project's constraints
+forbid. `toml` (for parsing `models.toml`) isn't in the tree at all yet — new
+addition, exact version to be pinned to whatever `cargo add toml` resolves at
+implementation time rather than guessed here.
 
-No contradiction found. The package proceeds.
+No contradiction with SPEC.md's Current State section. The package proceeds.
 
-**One environment gap, now resolved.** This machine's `rustup stable` was
-1.95.0; SPEC.md/CLAUDE.md pin `rust-version = "1.97"`, which `cargo` enforces
-against the root package and would have failed AC1 outright. Ran
-`rustup update stable`, which pulled 1.98.0 (released 2026-08-18). Toolchain
-now satisfies the pin. Flagging this because it's a machine-state change
-outside the repo, not something implied by the task.
+## Ambiguities resolved at kickoff
 
-**One behavioural note for later work packages, not a WP1 blocker.**
-`engine/stats.rs::save_search_stats` — called from both `SembleIndex::search`
-and `SembleIndex::find_related` — appends a JSON line to
-`dirs::home_dir()/.semble/savings.jsonl` on every call, silently swallowing
-any I/O error. That's a write outside the repository root on every search.
-WP3's `context_search` tool constraint ("confine all filesystem access to the
-repository root") will need to account for this — the do-not-refactor rule
-means we cannot change engine code to stop it. Recording it now so WP3
-doesn't discover it mid-package.
+Two things in WP2's acceptance criteria aren't fully determined by SPEC.md's
+prose and materially change `gating.rs`'s behavior, so I stopped and asked
+rather than picking silently:
+
+**1. Router/auto-select detection (AC7).** SPEC.md never defines how to
+recognize one. Resolution: ship a small built-in default list (exact id
+`openrouter/auto`; id ends with `/auto`; id contains `auto-router`), and let
+`[gating]` extend it with a `deny_id_patterns` array of substrings — a config
+field not literally named in T2.2's list (`min_context_length`,
+`require_tool_support`, `allow_unlisted`), added because the built-in list
+alone is provider-specific and brittle. Flagging the field addition itself
+for sign-off at this gate, separately from the mechanism it implements.
+
+**2. What `--allow-unlisted-model` actually bypasses (AC6 vs AC8).** T2.3's
+numbered check 1 ("the id is absent from the catalogue") and the sentence
+"`--allow-unlisted-model` skips check 1 only" read, taken completely
+literally, as if the flag lets an id through even when the live provider
+catalogue doesn't serve it at all — which would leave checks 2–4
+(tools/context/router) with no data to evaluate. That reading also makes
+AC6 ("an absent id exits 4") and AC8 ("an unlisted id exits 4 without the
+flag, proceeds with it") test the identical scenario under two names, which
+is an unlikely thing for two separate ACs to do. Resolution, confirmed:
+these are two distinct checks, only one of which SPEC.md numbers explicitly.
+
+- **Allowlist membership** — is `--model <id>` present in the resolved
+  `models.toml`? This is the *unnumbered*, earlier check. Skipped by
+  `--allow-unlisted-model` (this is what "`allow_unlisted`" as a config field
+  name, and "`--allow-unlisted-model`" as a flag name, both actually refer
+  to). AC8's scenario.
+- **Catalogue presence** — is the id in the *provider's live `/models`
+  response* at all? This is T2.3's numbered check 1. Always enforced,
+  no flag bypasses it — an id the provider doesn't serve has no data for
+  checks 2–4 to run against regardless of operator intent. AC6's scenario.
+
+So the full sequence for a given `--model <id>` is: allowlist membership
+(skippable) → fetch/cache catalogue → catalogue presence (check 1, not
+skippable) → tools (check 2, not skippable, ever) → context length
+(check 3) → router pattern (check 4).
+
+**3. AC4 needs a live provider.** `models --check` "against a live
+catalogue" requires a real base URL and API key; this sandbox has neither
+configured. You said you'll provide credentials before Verify. AC5–AC9 don't
+need this — they're driven by a local stub HTTP server (no new dependency;
+hand-rolled on `std::net::TcpListener`, mirroring what WP3's AC2 will need
+for the real LLM client) that returns fabricated catalogue responses and
+records whether a completions-shaped request ever arrives. AC4 itself will
+be run once by hand against whatever you provide and reported directly in
+the AC table, not wired into `cargo test` (a test that silently needs a
+secret to pass is worse than an explicit manual step).
 
 ## Approach
 
-### Crate shape
-
-Package name `codemason-core` (so the default lib crate name is
-`codemason_core`, matching SPEC T1.2's literal `codemason_core::Error` path)
-with an explicit `[[bin]]` target named `codemason` at `src/bin/codemason.rs`
-(SPEC's "distribution: single self-contained binary", CLI usage
-`codemason run ...`). `src/bin/codemason.rs` in WP1 is a placeholder
-`fn main() {}` — the real CLI arrives in WP2 T2.1. This split is a naming
-inference from the spec text, flagged here for the gate rather than assumed
-silently.
-
-### `Cargo.toml`
+### New dependencies (`Cargo.toml`)
 
 ```toml
-[package]
-name = "codemason-core"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.97"
-publish = false
-
-[lints.rust]
-unsafe_code = "deny"
-
-[[bin]]
-name = "codemason"
-path = "src/bin/codemason.rs"
-
-[features]
-default = []
-embeddings = ["dep:model2vec-rs", "dep:ndarray"]
-
-[dependencies]
-anyhow = "=1.0.104"
-chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock", "serde"] }
-regex = "=1.13.1"
-dirs = "=6.0.0"
-ignore = "=0.4.33"
-log = "=0.4.33"
-once_cell = "=1.21.4"
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
-tree-sitter = "=0.25.10"
-tree-sitter-c = "=0.23.4"
-tree-sitter-c-sharp = "=0.23.5"
-tree-sitter-cpp = "=0.23.4"
-tree-sitter-css = "=0.25.0"
-tree-sitter-go = "=0.23.4"
-tree-sitter-html = "=0.23.2"
-tree-sitter-java = "=0.23.5"
-tree-sitter-javascript = "=0.23.1"
-tree-sitter-kotlin-ng = "=1.1.0"
-tree-sitter-php = "=0.23.11"
-tree-sitter-python = "=0.23.6"
-tree-sitter-ruby = "=0.23.1"
-tree-sitter-rust = "=0.24.2"
-tree-sitter-swift = "=0.7.3"
-tree-sitter-typescript = "=0.23.2"
-model2vec-rs = { version = "=0.2.1", optional = true }
-ndarray = { version = "=0.15.6", optional = true }
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
+clap = "=4.6.6"                                            # builder API — Command/Arg, not #[derive(Parser)]
+toml = "=<resolved>"                                       # models.toml parsing — pin whatever `cargo add` resolves
+ureq = { version = "=2.12.1", default-features = false, features = ["json", "tls"] }
 ```
 
-Every version above is copied from the source project's own pins (its
-`Cargo.toml` and workspace `[workspace.dependencies]`), not freshly
-resolved — matching SPEC's "known-good set... do not resolve fresh ones."
-`env_logger` is in the source crate's manifest but grep found zero use of it
-inside `engine/` itself (only bare `log::` macro calls, which need the `log`
-crate but not an initializer) — left out of WP1's dependency set since
-nothing in the vendored code needs it; a later WP can add it if the runner
-wants to initialize a logger.
+`ureq`'s `tls` feature is its rustls backend (not `native-tls`) —
+`default-features = false` makes that an explicit choice rather than
+something that happens to be true of the current default feature set, since
+"rustls only" is a hard constraint checked at Milestone Validation, not just
+WP1. Re-run the `cargo tree` grep for `openssl`/`native-tls`/`tokio` after
+adding these, same as WP1's AC2 check.
 
-### `rust-toolchain.toml`
+### `src/cli.rs` + `src/bin/codemason.rs`
+
+`clap::Command` builder tree: root `codemason` with three subcommands.
+`run`'s `--task` accepts `TEXT|@FILE` — a leading `@` means "read task text
+from this file path" (resolved relative to the current working directory,
+consistent with `--models-config`/`--log`, not the target `--repo`, since the
+task file is the operator's, not the target repository's).
+
+`--base-url` / `--api-key` env fallbacks: `CODEMASON_BASE_URL` /
+`CODEMASON_API_KEY`. Not named in SPEC.md — inference, flagged for sign-off.
+(Not `OPENAI_*`: the base URL is explicitly arbitrary-provider, and reusing
+OpenAI's own env var names on a non-OpenAI endpoint would be misleading.)
+
+`main()` stays thin: build the CLI, parse, dispatch to `config`/`gating`/
+`index`, map the `Result` to one of the six exit codes via
+`std::process::exit`. Exit-code mapping lives in `src/cli.rs` next to the
+subcommand definitions (`enum ExitCode` mirroring SPEC's table), not
+scattered across call sites.
+
+`run`'s WP2 body: parse flags → resolve `models.toml` via `config::resolve`
+→ resolve `--model` (or the allowlist's first/default entry) → resolve
+`base_url`/`api_key` (flag, else env, else error) → `gating::check(...)` →
+on `Err`, print the rejection reason to stderr, exit 4 → on `Ok`, print
+`"model {id} passed gating; execution loop is not implemented until WP3"` to
+stderr, exit 0. `--dry-run` etc. are parsed and stored on the config struct,
+unused this package — still listed in `--help` (AC1 needs every documented
+flag to appear, not to do anything yet).
+
+### `src/config.rs`
+
+```rust
+pub struct ModelEntry { pub id: String, pub role: String }
+pub struct GatingConfig {
+    pub min_context_length: u64,
+    pub require_tool_support: bool,
+    pub allow_unlisted: bool,
+    pub deny_id_patterns: Vec<String>,   // new field, see Ambiguity 1
+}
+pub struct ModelsConfig { pub models: Vec<ModelEntry>, pub gating: GatingConfig }
+
+pub fn resolve(explicit: Option<&Path>) -> Result<(PathBuf, ModelsConfig), Error>;
+```
+
+Resolution: if `--models-config` is given, use exactly that path — error
+naming it if missing/malformed, no fallback (an explicit path is the operator
+pointing at a specific file; silently falling through past it would hide a
+typo). Otherwise try `./models.toml`, then
+`dirs::config_dir()/codemason/models.toml` in order; first one that exists
+wins. If none exist, exit 1 listing every path that was tried (AC3). Malformed
+TOML at whichever path was chosen: exit 1 naming the file path and the
+`toml` crate's parse error (line/column included, since `toml`'s error type
+carries it).
+
+### `src/gating.rs`
+
+```rust
+pub struct CatalogueEntry {
+    pub id: String,
+    pub context_length: u64,
+    pub supported_parameters: Vec<String>,
+}
+
+pub fn fetch_catalogue(base_url: &str, api_key: &str) -> Result<Vec<CatalogueEntry>, Error>;
+// GET {base_url}/models, Authorization: Bearer {api_key}, JSON `{"data": [...]}`
+// (OpenAI/OpenRouter list-endpoint convention — SPEC doesn't name the path,
+// flagged for sign-off same as WP1's package-naming inference).
+
+pub struct GateRejection { pub reason: String }
+
+pub fn check(
+    id: &str,
+    allow_unlisted: bool,
+    allowlist: &[ModelEntry],
+    gating: &GatingConfig,
+    catalogue: &[CatalogueEntry],
+) -> Result<(), GateRejection>;
+```
+
+Cache: `dirs::cache_dir()/codemason/catalogue/<sanitized-base-url>.json`,
+storing `{fetched_at: RFC3339, entries: [...]}` via `serde`. 24h TTL measured
+against `fetched_at`. A fetch failure with a valid (even if expired-by-clock
+but present) cache entry is non-fatal — spec says "non-fatal only with a
+valid cache entry," read as *present*, not as *unexpired*, since the whole
+point of falling back is the network being unavailable. Sanitization is a
+simple non-alphanumeric-to-`_` pass on the base URL string, just enough to
+be a legal filename — not a hash, so the cache file stays human-inspectable.
+
+### `models.toml` (sample, repo root)
 
 ```toml
-[toolchain]
-channel = "stable"
-components = ["rustfmt", "clippy"]
-profile = "default"
+# Placeholder ids. Real ids MUST be validated with `codemason models --check`
+# before use — this file is not fetched or trusted blindly.
+
+[[model]]
+id = "REPLACE_ME/example-primary-model"
+role = "primary"
+
+[[model]]
+id = "REPLACE_ME/example-fallback-model"
+role = "fallback"
+
+[gating]
+min_context_length = 32000
+require_tool_support = true
+allow_unlisted = false
+# deny_id_patterns extends the built-in router/auto-select denylist
+# (openrouter/auto, ids ending "/auto", ids containing "auto-router").
+deny_id_patterns = []
 ```
 
-Copied from source verbatim — same reasoning applies (tracks current stable
-rather than floor edition-2024 support).
+### `src/error.rs` additions
 
-### `.gitignore`
-
-Standard Rust: `/target`, plus `old_source/` (so the reference tree never
-enters git tracking) and a note that it's a local reference only.
-
-### `src/lib.rs`
-
-```rust
-pub mod engine;
-pub mod error;
-pub mod index;
-
-pub use engine::{Chunk, DependencyGraph, IndexStats, SearchResult};
-pub use error::Error;
-pub use index::Index;
-```
-
-### `src/error.rs`
-
-`codemason_core::Error` as a `thiserror`-free (no new dependency) plain enum
-or `enum Error { ... }` implementing `std::error::Error` + `Display` by
-hand, OR pull in `thiserror` (already an approved dependency per SPEC WP3,
-just not yet declared) — decision: add `thiserror = "=2.0.19"` now since
-WP2/WP3 need it anyway and T1.2 explicitly calls for "this project's own
-error type," which reads better with `thiserror`'s derive. Variants needed
-for WP1's actual surface: `IndexBuild(anyhow::Error)`,
-`EmbeddingsFeatureDisabled`. No reference to `harness_core::ExitCode` or
-any type from `old_source` — exit-code mapping is CLI-layer, arrives in WP2.
-
-### `src/engine/**`
-
-Byte-for-byte copy of
-`old_source/navex-harness-main/harness/crates/lib/context/src/engine/` into
-`src/engine/`. No renames, no formatting pass, no clippy fixes even if
-`cargo clippy` flags something. `ORIGIN.md` copied alongside (already lives
-inside the source `engine/` folder, so it comes along with the directory
-copy). The licence file is `LICENSE.semble` at the *source crate's* root,
-not inside `engine/` — copied to `LICENSE-ENGINE` at the codemason crate
-root per SPEC's file list, content unchanged (MIT, hunsang jo).
-
-### `src/index.rs`
-
-```rust
-pub struct Index {
-    inner: engine::SembleIndex,
-    stats: BuildStats, // wraps engine::IndexStats + build_ms
-}
-
-impl Index {
-    pub fn build(repo_root: &Path) -> Result<Self, Error> { ... } // encoder: None, times the call
-    pub fn search(&self, query: &str, top_k: usize) -> Vec<SearchResult> { ... }
-    pub fn chunks(&self) -> &[Chunk] { ... }
-    pub fn graph(&self) -> &DependencyGraph { ... }
-    pub fn stats(&self) -> &BuildStats { ... }
-
-    #[cfg(feature = "embeddings")]
-    pub fn find_related(&self, chunk: &Chunk, top_k: usize) -> Result<Vec<SearchResult>, Error> { ... }
-    #[cfg(not(feature = "embeddings"))]
-    pub fn find_related(&self, _chunk: &Chunk, _top_k: usize) -> Result<Vec<SearchResult>, Error> {
-        Err(Error::EmbeddingsFeatureDisabled)
-    }
-}
-```
-
-`find_related` isn't in T1.3's named export list (`build, search, chunks,
-graph, stats`), but AC6 ("the similarity call returns an error naming the
-missing feature") is only testable if the wrapper exposes *something* that
-reaches it, and it's the only call in the engine that needs the encoder.
-Exposing it cfg-gated the way above is the minimal way to satisfy AC6
-without adding a tool or contradicting T1.3's list — flagging the
-discrepancy here rather than silently picking one reading.
+New variants: `ConfigNotFound { searched: Vec<PathBuf> }`,
+`ConfigParse { path: PathBuf, source: toml::de::Error }`,
+`CatalogueFetch(ureq::Error)`, `ModelGated(GateRejection)`,
+`MissingCredential(&'static str)` (for absent `--api-key`/`--base-url` with
+no env fallback). No reference to any external crate's exit-code type, per
+T1.2's rule carried forward.
 
 ## Test strategy, by acceptance criterion
 
-- **AC1** `cargo build --release` — run directly, record pass/fail.
-- **AC2** `cargo tree` — grep output for `model2vec`, `ndarray`, `openssl`,
-  `git2`, `tokio`/`async-std`, and any `path`/`git` dependency line; must be
-  empty on the default feature set.
-- **AC3** `cargo build --release --features embeddings` — run directly.
-- **AC4** `codemason index --stats`-equivalent: a `#[test]` in
-  `src/index.rs` that builds an `Index` against
-  `old_source/navex-harness-main/metric-measurement-service` (real C# repo,
-  675 `.cs` files, already on disk) and asserts `total_chunks > 0` and
-  `indexed_files > 0`. This test reads `old_source/` at test time only — it
-  is not copied, committed, or depended on by the shipped crate.
-- **AC5** Same fixture: `index.search("AgentSchedulerService", 5)` (a real
-  type name from that repo) asserts the top result's `chunk.file_path` ends
-  in `AgentSchedulerService.cs`.
-- **AC6** Unit test built *without* the `embeddings` feature: call
-  `find_related` and assert the error names the feature.
-- **AC7** No test — a direct recursive diff (`diff -rq` /
-  `Compare-Object`) of `src/engine/` against
-  `old_source/navex-harness-main/harness/crates/lib/context/src/engine/`,
-  run and reported as text output, not a script left in the tree.
+- **AC1** `Command::new(env!("CARGO_BIN_EXE_codemason")).arg("--help")` —
+  assert stdout contains `run`, `models`, `index`, and every documented flag
+  string.
+- **AC2** Integration test: `codemason index --repo <fixture> --stats`
+  against the same `old_source` C# fixture WP1 used (same on-disk-only
+  caveat), assert exit 0 and plausible fields in the printed stats.
+- **AC3** Unit tests in `config.rs`: well-formed file → ordered `Vec`
+  matching file order; syntactically broken TOML → `Err` naming file + parse
+  error; no file at any searched location → `Err` listing all searched
+  paths.
+- **AC4** Manual — run by hand once real credentials are available, result
+  recorded directly in the AC table.
+- **AC5–AC8** Local stub server (`TcpListener`, hand-rolled minimal HTTP,
+  same approach WP3 will reuse) serving a fabricated `/models` catalogue per
+  scenario (no `tools` in `supported_parameters`; id absent entirely; id
+  matching a router pattern; id absent from `models.toml` with/without
+  `--allow-unlisted-model`). Drive each through `codemason run`, assert the
+  exit code, and assert the stub's request log contains only the `GET
+  /models` call — no completions-shaped `POST`, satisfying the package
+  gate's explicit demand to prove that rather than infer it from the exit
+  code alone.
+- **AC9** Same stub, request counter. Two `codemason run` invocations
+  against the same `--base-url` inside the TTL: assert exactly one `GET
+  /models` total across both.
 
 ## Risk flags
 
-1. **Package/crate naming is an inference**, not a spec quote — flagged
-   above, wants explicit sign-off at the gate.
-2. **`thiserror` pulled in one package early** (WP3 territory) because
-   T1.2's error type is awkward without it — flagged for sign-off.
-3. **`stats.rs` writes outside the repo root** on every search call — noted
-   for WP3, not fixed here (do-not-refactor).
-4. **AC4/AC5 fixtures reach into `old_source/`** at test time. That
-   directory is a local reference tree, not part of this repo's committed
-   history — a test depending on it only works on this machine. Flagging
-   so you can tell me whether to (a) accept that for WP1's own dev-loop
-   verification only, since nothing under `src/` or `Cargo.toml` references
-   it, or (b) copy a small fixture repo into this repo now instead. Default
-   plan is (a): WP5 already owns building a proper fixture repo, and
-   duplicating that early is scope creep.
-5. **`old_source/` must never be committed.** It's already untracked per
-   `git status`; the `.gitignore` entry above makes that durable rather than
-   incidental.
+1. **`clap` builder API, not `derive`** — SPEC.md T2.1 says "builder API"
+   explicitly; noting it because `derive` is the more common default choice
+   and I want the constraint on record before writing code against it.
+2. **`CODEMASON_BASE_URL`/`CODEMASON_API_KEY` env var names** are an
+   inference, not a spec quote.
+3. **Catalogue endpoint path** (`{base_url}/models`, OpenAI/OpenRouter list
+   convention) is an inference — SPEC.md names the *response fields*
+   (`context_length`, `supported_parameters`) but never the path.
+4. **`deny_id_patterns` is a new `models.toml` field** beyond T2.2's literal
+   three (`min_context_length`, `require_tool_support`, `allow_unlisted`) —
+   product of resolving Ambiguity 1 above, flagged again here since it
+   changes the shipped sample file's shape.
+5. **Cache file location/format/sanitization scheme** under
+   `dirs::cache_dir()` is an inference — SPEC.md specifies the 24h TTL and
+   the non-fatal-with-valid-cache behavior but not the storage mechanism.
+6. **AC4 is not automated** — needs a live credential this sandbox doesn't
+   have; will be exercised manually once provided and reported as an actual
+   run result, not skipped silently.
+7. **`toml` crate version** is unpinned in this plan pending `cargo add`'s
+   resolution at implementation time — consistent with how WP1 handled
+   already-pinned engine deps versus this package's genuinely new ones.
