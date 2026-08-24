@@ -73,6 +73,15 @@ sibling jobs, and cannot discover a contract defined elsewhere. So:
 - Write out any interface, signature, schema or constant the job must match,
   *verbatim in the task text*. Do not write "match the interface in service B" —
   the job cannot see service B.
+- Name external dependencies exactly: the package id as it is published, and a
+  real version. "Add the Orleans persistence package" is not enough. One job
+  invented `Microsoft.Orleans.Persistence.PostgreSQL`, which does not exist on
+  nuget.org, when the package it needed was
+  `Microsoft.Orleans.Persistence.AdoNet`, and two fix cycles were spent finding
+  that out. Pasting our own contracts in does not help here — the guess is about
+  the outside world, not about this repository. Add to the task text that if a
+  package fails to restore, the job must remove the reference and say so rather
+  than guessing another name.
 - Name the files the job is expected to touch.
 - State the acceptance check: the build or test command that proves it worked.
 

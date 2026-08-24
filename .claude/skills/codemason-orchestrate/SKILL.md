@@ -127,6 +127,15 @@ Two rules that are not negotiable:
   interface has to be written into A's task text verbatim — the job cannot
   discover it. Contract-first decomposition is forced by the interface, not a
   style preference.
+- **Pin external dependencies the same way.** The rule does not stop at our own
+  code. An item that needs an external package must be given the exact package
+  id and a real version in its task text. One run invented
+  `Microsoft.Orleans.Persistence.PostgreSQL`, which does not exist on nuget.org;
+  the package it wanted was `Microsoft.Orleans.Persistence.AdoNet`, and two fix
+  cycles went on discovering that. Pasting our own contracts in prevents nothing
+  here, because the guess is about the outside world rather than this
+  repository. Tell the job that a package which fails to restore must be removed
+  and reported, not swapped for another guess.
 
 ### 4. Execute
 
@@ -154,7 +163,27 @@ test suite**. That test result is the gate.
 did. `files_changed`, `commit`, and the test suite are what actually happened.
 
 On failure, localise to the owning partition and re-dispatch a bounded fix job.
-Cap it at 2 cycles. Never let a fix job silence or delete tests.
+Never let a fix job silence or delete tests.
+
+**At most two fix cycles per work item, then escalate to a human.** The cap
+comes from a run that did not have one. A work item building an Orleans
+"Grains" project exited on budget with partial work committed, and three fix
+cycles followed:
+
+1. the package references carried no version — `NU1015`.
+2. the model invented a NuGet package that does not exist — `NU1101`.
+3. the correct package restored, and 36 code errors that had been hidden behind
+   the restore failure surfaced underneath.
+
+Three cycles, roughly $0.14, and the item was no closer to green than when it
+started. The error set kept changing shape rather than shrinking, because the
+root cause was the model's weak knowledge of an external framework — nothing
+orchestration could fix by dispatching again.
+
+So the diagnostic worth applying every cycle: **if the error set changes shape
+between cycles rather than shrinking, more cycles will not converge.** Stop
+there, even if the cap has not been reached, and hand the item to a human with
+its branch, its commit and the current error list.
 
 Do not open pull requests or wait on CI — that layer is deliberately deferred
 (`ORCHESTRATION.md`). Merge locally and test locally.
@@ -181,6 +210,9 @@ The exit code says *how a run stopped*, not *whether the work is done*.
 Rows 2 and 3 are the ones that matter. In a real run the model completed its
 task correctly, kept re-reading files instead of stopping, and exited 3 with the
 correct work committed. Treating exit 3 as failure discards good work.
+
+Re-dispatching on those rows is bounded like any other fix: at most two cycles
+per work item, then escalate (see *5. Integrate*).
 
 ## Running the whole pipeline
 

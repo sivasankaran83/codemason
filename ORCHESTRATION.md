@@ -221,6 +221,17 @@ Discovery the planner has already done must not be paid for again by every
 job. Paste in the interfaces and constants, name the two or three files worth
 reading, and say not to explore past them.
 
+**External dependencies need pinning the same way.** Pasting our own contracts
+in does nothing for this case, because the guess is about the outside world
+rather than about our repository. Observed: a job added package references with
+no version and failed the build (NU1015), and the next attempt invented
+`Microsoft.Orleans.Persistence.PostgreSQL`, which does not exist on nuget.org —
+the real package is `Microsoft.Orleans.Persistence.AdoNet`. Two fix cycles went
+on it. When a work item needs an external package, the planner names the exact
+package id and a real version in the task text, and instructs the job that if a
+package fails to restore it must remove the reference and say so rather than
+guessing another name.
+
 **The context bottleneck lives here.** `codemason` accepts exactly one input
 channel for context: the `--task` string, plus whatever is on disk in the
 repository it is pointed at. Everything the planner knows — the interface a
@@ -274,8 +285,9 @@ that to ~4x.
 
 1. Merge each branch into the integration base, in level order.
 2. **Run the target repository's own test suite.** This is the gate.
-3. On failure, localise to the owning partition and re-dispatch a bounded fix
-   job — SWE-AF caps this at 2 cycles, which is a sane default.
+3. On failure, localise to the owning partition and re-dispatch a fix job —
+   **at most 2 fix cycles per work item, then escalate to a human.** See "Fix
+   cycles are capped at two" below for where that number comes from.
 4. The fixer must never be permitted to silence or delete tests.
 
 **Never gate on `summary`.** The `summary` field is the model's own account of
@@ -306,7 +318,7 @@ stopped*, not *whether the work is done* — the two are genuinely different.
 | exit | meaning | action |
 |---|---|---|
 | 0 | completed | run the tests; accept or re-dispatch |
-| 2 | budget exceeded — **work is committed** | run the tests. Pass: accept. Fail: re-dispatch with remaining budget |
+| 2 | budget exceeded — **work is committed** | run the tests. Pass: accept. Fail: re-dispatch with remaining budget, within the fix-cycle cap |
 | 3 | iteration ceiling — **work is committed** | as above |
 | 1 | unrecoverable | escalate. Dirty tree, bad config, worktree failure — retrying will not fix it |
 | 4 | model gated | escalate. Allowlist problem; retrying spends money for nothing |
@@ -316,6 +328,32 @@ Rows 2 and 3 are the ones that matter and the ones a naive supervisor gets
 wrong. Observed in a real run: the model completed the task correctly, kept
 re-reading files instead of stopping, and exited 3. Partial work was committed
 and was correct. Treating exit 3 as failure would have discarded it.
+
+### Fix cycles are capped at two
+
+Every re-dispatch path in the table above is bounded: **at most 2 fix cycles
+per work item, then escalate to a human.** Without a cap the supervisor will
+re-dispatch indefinitely, and it will spend money doing it.
+
+The number comes from a run that exceeded it. A work item building an Orleans
+"Grains" project exited on budget with partial work committed, and three fix
+cycles followed:
+
+| cycle | what the job did | result |
+|---|---|---|
+| 1 | added package references with no version | build error NU1015 |
+| 2 | invented a NuGet package that does not exist (`Microsoft.Orleans.Persistence.PostgreSQL`) | restore error NU1101 |
+| 3 | correct package supplied | restore succeeded, and 36 previously hidden code errors surfaced underneath |
+
+Three cycles, roughly $0.14, and the error set kept *shifting* rather than
+shrinking. It never converged, and it was not going to: the root cause was the
+model's weak knowledge of an external framework, which is not something
+orchestration can fix. A fourth cycle would have produced a fourth error set.
+
+The diagnostic that matters: **if the error set changes shape between cycles
+rather than shrinking, more cycles will not converge.** A shrinking error count
+is a job making progress. A moving one is a job guessing, and that is the
+signal to escalate — without waiting for the cap.
 
 ---
 

@@ -100,6 +100,11 @@ const INTEGRATION = {
     testsPassed: { type: 'boolean' },
     testCommand: { type: 'string' },
     failureSummary: { type: 'string' },
+    failingPartition: { type: 'string' },
+    // Reported per attempt so the fix loop can tell a shrinking error set from
+    // a shifting one. A shifting one does not converge.
+    errorCount: { type: 'integer' },
+    errorCodes: { type: 'array', items: { type: 'string' } },
     integrationBranch: { type: 'string' },
   },
 }
@@ -212,29 +217,128 @@ const committed = runs.filter((r) => r.commit)
 
 phase('Integrate')
 
-const integration = committed.length
-  ? await agent(
-      `Integrate these codemason branches in repository ${repo}.\n\n` +
-        JSON.stringify(
-          committed.map((r) => ({ item: r.itemId, level: r.level, repo: r.repo, branch: r.branch, commit: r.commit })),
-          null,
-          1,
-        ) +
-        `\n\nSteps:\n` +
-        `1. Create an integration branch from the current base.\n` +
-        `2. Merge each branch in LEVEL ORDER. Record any that conflict — do NOT resolve ` +
-        `conflicts by hand or by rewriting code; report them and stop merging that branch.\n` +
-        `3. Run the repository's own test suite (find it: cargo test, npm test, go test, dotnet test).\n` +
-        `4. Report whether it passed, and if not, which partition the failure belongs to.\n\n` +
-        `Do NOT open a pull request and do not wait on CI — that layer is deliberately ` +
-        `out of scope.\n` +
-        `Do NOT silence, skip or delete tests under any circumstances. If tests fail, that ` +
-        `is the finding.`,
-      { label: 'integrate', phase: 'Integrate', schema: INTEGRATION },
-    )
+// A work item gets at most this many fix cycles before a human sees it.
+// Measured: three cycles on one item cost roughly $0.14 and never converged —
+// version-less package references (NU1015), then a NuGet package the model
+// invented and which does not exist (NU1101), then 36 code errors that had
+// been hidden behind the restore failure. The error set changed shape each
+// cycle instead of shrinking, which is the signature of a root cause that
+// re-dispatching cannot reach — here, weak model knowledge of an external
+// framework. Cycles past the second spend money moving the errors around.
+const MAX_FIX_CYCLES = 2
+
+function integrationPrompt(cycle) {
+  return (
+    `Integrate these codemason branches in repository ${repo}.\n\n` +
+    JSON.stringify(
+      committed.map((r) => ({ item: r.itemId, level: r.level, repo: r.repo, branch: r.branch, commit: r.commit })),
+      null,
+      1,
+    ) +
+    (cycle ? `\n\nThis is the re-check after fix cycle ${cycle} of ${MAX_FIX_CYCLES}.` : '') +
+    `\n\nSteps:\n` +
+    `1. Create an integration branch from the current base.\n` +
+    `2. Merge each branch in LEVEL ORDER. Record any that conflict — do NOT resolve ` +
+    `conflicts by hand or by rewriting code; report them and stop merging that branch.\n` +
+    `3. Run the repository's own test suite (find it: cargo test, npm test, go test, dotnet test).\n` +
+    `4. Report whether it passed, and if not, which partition the failure belongs to ` +
+    `(\`failingPartition\`).\n` +
+    `5. Report \`errorCount\` — how many distinct errors the build or test run printed — and ` +
+    `\`errorCodes\`, their identifiers (NU1101, CS0246, failing test names). Report what the ` +
+    `tool printed, not a summary of it: these decide whether a fix cycle is converging.\n\n` +
+    `Do NOT open a pull request and do not wait on CI — that layer is deliberately ` +
+    `out of scope.\n` +
+    `Do NOT silence, skip or delete tests under any circumstances. If tests fail, that ` +
+    `is the finding.`
+  )
+}
+
+// Converging means the same errors, fewer of them. An attempt that introduces
+// error kinds the previous one did not have has moved the error set rather
+// than shrunk it, and further cycles will not close it.
+function converging(before, after) {
+  if (!before || !after) return false
+  const b = before.errorCodes || []
+  const a = after.errorCodes || []
+  if (a.some((code) => !b.includes(code))) return false
+  if (typeof before.errorCount === 'number' && typeof after.errorCount === 'number') {
+    return after.errorCount < before.errorCount
+  }
+  return a.length < b.length
+}
+
+let integration = committed.length
+  ? await agent(integrationPrompt(0), { label: 'integrate', phase: 'Integrate', schema: INTEGRATION })
   : null
 
-const totals = runs.reduce(
+const fixRuns = []
+const fixCycles = []
+let stoppedConverging = false
+
+while (integration && integration.testsPassed === false && fixCycles.length < MAX_FIX_CYCLES) {
+  const cycle = fixCycles.length + 1
+  const before = integration
+  log(`integration tests failed — fix cycle ${cycle} of ${MAX_FIX_CYCLES}`)
+
+  const fix = await agent(
+    `Dispatch exactly ONE bounded codemason fix job. This is fix cycle ${cycle} of ` +
+      `${MAX_FIX_CYCLES}; after the cap the item goes to a human, not to another cycle.\n\n` +
+      `Integration tests failed. Failure:\n${before.failureSummary || '(none reported)'}\n\n` +
+      `Errors reported: ${JSON.stringify(before.errorCodes || [])}\n` +
+      `Owning partition: ${before.failingPartition || 'unknown — localise it from the failure above'}\n\n` +
+      `Write the --task text yourself from that failure. It must name the exact files and the ` +
+      `exact errors, and nothing beyond them.\n\n` +
+      `Command shape:\n` +
+      `codemason run --repo ${repo} --worktree \\\n` +
+      `  --task "<the fix task you wrote>" \\\n` +
+      `  --budget-tokens ${budget} --max-iterations ${maxIterations}` +
+      (model ? ` \\\n  --model ${model}` : '') +
+      (dryRun ? ` \\\n  --dry-run` : '') +
+      `\n\n` +
+      `If the fix needs an external package, put the exact package id and a real version in ` +
+      `the task text — a job left to guess a package name will invent one that does not ` +
+      `exist. Instruct it that a package which fails to restore must be removed and reported, ` +
+      `not replaced with another guess.\n\n` +
+      `Do NOT edit any file yourself and do NOT silence, skip or delete tests. Report the ` +
+      `codemason JSON verbatim.`,
+    { label: `fix:${cycle}`, phase: 'Integrate', schema: RUN },
+  )
+
+  if (fix) fixRuns.push({ ...fix, itemId: `fix:${cycle}`, cycle, repo })
+
+  integration = await agent(integrationPrompt(cycle), {
+    label: `integrate:${cycle}`,
+    phase: 'Integrate',
+    schema: INTEGRATION,
+  })
+
+  if (integration && integration.testsPassed === false && !converging(before, integration)) {
+    stoppedConverging = true
+  }
+
+  fixCycles.push({
+    cycle,
+    failureBefore: before.failureSummary || null,
+    errorCountBefore: typeof before.errorCount === 'number' ? before.errorCount : null,
+    errorCountAfter: integration && typeof integration.errorCount === 'number' ? integration.errorCount : null,
+    fix: fix ? { exitCode: fix.exitCode, branch: fix.branch || null, commit: fix.commit || null } : null,
+    testsPassed: !!(integration && integration.testsPassed),
+  })
+
+  // Shape change rather than shrinkage: the remaining cycle would spend money
+  // moving the errors around. Escalate now instead of using it up.
+  if (stoppedConverging) {
+    log('error set changed shape rather than shrinking — escalating instead of retrying')
+    break
+  }
+}
+
+const needsHuman = !!(integration && integration.testsPassed === false)
+if (needsHuman) {
+  log(`unresolved after ${fixCycles.length} fix cycle(s) — escalate to a human`)
+}
+
+const totals = [...runs, ...fixRuns].reduce(
   (acc, r) => ({
     tokens: acc.tokens + (r.totalTokens || 0),
     cost: acc.cost + (r.cost || 0),
@@ -273,10 +377,17 @@ return {
   partialWorkCommitted: partial.map((r) => ({ item: r.itemId, exitCode: r.exitCode })),
   needsEscalation: escalate.map((r) => ({ item: r.itemId, exitCode: r.exitCode, status: r.status })),
   integration,
+  fixCycles,
+  fixCycleCap: MAX_FIX_CYCLES,
+  escalatedToHuman: needsHuman,
   totals,
   verdict: integration
     ? integration.testsPassed
-      ? 'tests passed after integration'
-      : 'INTEGRATION TESTS FAILED — do not accept this build'
+      ? fixCycles.length
+        ? `tests passed after ${fixCycles.length} fix cycle(s)`
+        : 'tests passed after integration'
+      : stoppedConverging
+        ? 'INTEGRATION TESTS FAILED — the error set shifted rather than shrank; escalate to a human'
+        : `INTEGRATION TESTS FAILED after ${fixCycles.length} fix cycle(s) at the cap — escalate to a human`
     : 'nothing was committed; no integration attempted',
 }
