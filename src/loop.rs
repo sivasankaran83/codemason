@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
+use crate::compact;
 use crate::index::Index;
 use crate::llm::{self, ChatMessage, UsageLedger};
 use crate::log::{event_type, EventLog};
@@ -27,6 +28,9 @@ pub struct LoopConfig {
     pub budget_tokens: u64,
     pub budget_usd: Option<f64>,
     pub dry_run: bool,
+    /// Tool results older than this many assistant turns are elided from
+    /// what is sent, never from `history`. `0` disables it.
+    pub keep_recent_turns: u32,
 }
 
 #[derive(Debug)]
@@ -123,7 +127,24 @@ pub fn run(
         }
         iterations += 1;
 
-        let completion = match client.complete(&cfg.model, &history, &tool_defs) {
+        // Elide stale tool results before the call, never in `history`
+        // itself: the run's own record stays complete, and only what goes on
+        // the wire is trimmed. See `compact` for why this is not
+        // summarisation.
+        let (sent, elision) = compact::elide_stale_tool_results(&history, cfg.keep_recent_turns);
+        if elision.any() {
+            log.write(
+                event_type::CONTEXT_ELIDED,
+                json!({
+                    "iteration": iterations,
+                    "elided_messages": elision.elided_messages,
+                    "elided_bytes": elision.elided_bytes,
+                    "keep_recent_turns": cfg.keep_recent_turns,
+                }),
+            );
+        }
+
+        let completion = match client.complete(&cfg.model, &sent, &tool_defs) {
             Ok(result) => result,
             Err(err) => {
                 log.write(
@@ -153,6 +174,7 @@ pub fn run(
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
                         "total_tokens": usage.total_tokens,
+                        "cached_tokens": usage.cached_tokens(),
                     }),
                 );
             }

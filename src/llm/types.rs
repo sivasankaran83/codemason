@@ -89,6 +89,36 @@ pub struct Usage {
     /// estimated locally.
     #[serde(default)]
     pub cost: Option<f64>,
+    /// Prompt-cache detail, when the provider reports it.
+    ///
+    /// The conversation prefix — system prompt, then task, then an
+    /// append-only history — never changes between calls, which is what lets
+    /// a provider cache it. Most of a run's prompt spend is that repeated
+    /// prefix, so how much of it was served from cache is the single most
+    /// useful cost number after the totals themselves. Measured, never
+    /// inferred: absent when the provider says nothing.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenRouter reports the cache saving directly, as a negative-cost
+    /// adjustment already reflected in `cost`.
+    #[serde(default)]
+    pub cache_discount: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+impl Usage {
+    /// Prompt tokens served from the provider's cache, when reported.
+    pub fn cached_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Serialize)]

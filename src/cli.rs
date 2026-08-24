@@ -84,6 +84,16 @@ fn run_command() -> Command {
                 .long("worktree")
                 .action(ArgAction::SetTrue),
         )
+        // Context elision. History is re-sent whole on every call, so prompt
+        // spend grows quadratically with iteration count; on a measured
+        // 21-iteration run, 92% of the tokens billed were re-sent history.
+        // 0 disables it and restores the pre-amendment behaviour exactly.
+        .arg(
+            Arg::new("keep-recent-turns")
+                .long("keep-recent-turns")
+                .value_name("N")
+                .default_value("3"),
+        )
         .arg(
             Arg::new("allow-unlisted-model")
                 .long("allow-unlisted-model")
@@ -176,6 +186,7 @@ pub struct RunArgs {
     pub log: Option<PathBuf>,
     pub dry_run: bool,
     pub worktree: bool,
+    pub keep_recent_turns: u32,
     pub allow_unlisted_model: bool,
     pub verbose: bool,
 }
@@ -212,6 +223,10 @@ impl RunArgs {
             log: matches.get_one::<String>("log").map(PathBuf::from),
             dry_run: matches.get_flag("dry-run"),
             worktree: matches.get_flag("worktree"),
+            keep_recent_turns: matches
+                .get_one::<String>("keep-recent-turns")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(crate::compact::DEFAULT_KEEP_RECENT_TURNS),
             allow_unlisted_model: matches.get_flag("allow-unlisted-model"),
             verbose: matches.get_flag("verbose"),
         })

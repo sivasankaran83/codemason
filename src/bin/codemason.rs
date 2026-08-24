@@ -190,6 +190,7 @@ fn run_cmd(sub: &clap::ArgMatches) -> ExitCode {
         budget_tokens: args.budget_tokens,
         budget_usd: args.budget_usd,
         dry_run: args.dry_run,
+        keep_recent_turns: args.keep_recent_turns,
     };
 
     let (exit, ledger) = codemason_core::run_loop(&loop_cfg, &client, &index, &mut event_log);

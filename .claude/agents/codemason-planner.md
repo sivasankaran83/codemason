@@ -83,10 +83,33 @@ and its repository, is underspecified. Rewrite it.
 they go in different levels — A first. Within a level, order is arbitrary and
 everything runs at once.
 
-**Prefer fewer, larger items.** Coordination is expensive and every extra
-concurrent job is another chance to conflict. Do not split work that one job
-could do sequentially in one pass. Parallelism is only worth its overhead when
-the pieces are genuinely independent.
+**Size items against two opposing costs.** This is a real trade-off, not a
+preference, and both sides are measured:
+
+- *Too many items* costs coordination and conflict risk. Every extra
+  concurrent job is another branch to merge and another chance two jobs
+  disagree at a boundary.
+- *Too few items* costs tokens, quadratically. History is re-sent on every
+  call, so a job's prompt spend grows with the square of its iteration count.
+  A 21-iteration run measured 411,469 prompt tokens for a 33,678-token
+  conversation — 92% re-sent history. Three seven-iteration jobs doing the
+  same work cost dramatically less than one twenty-one-iteration job.
+
+The practical rule: **an item should be completable in roughly 5-10 tool-using
+iterations.** If you cannot see how a job would finish in that many steps,
+split it. If two items would each take two steps, merge them.
+
+**Write the task text so the job acts early.** The dominant failure mode
+observed in practice is a job that reads exhaustively and never writes: one
+run made 31 `read_file` calls, zero `write_file` calls, and exhausted its
+budget having produced nothing. The same task, with the relevant contracts
+pasted directly into the task text and a "write code early, read at most 2
+files" instruction, committed 14 files.
+
+So: paste in the interfaces, signatures and constants the job needs, name the
+two or three files worth reading, and say explicitly not to explore beyond
+them. Discovery the planner has already done must not be paid for again by
+every job.
 
 **Say when parallelism does not apply.** If the goal touches one cohesive area,
 or the partitions show `degrades_to_sequential`, say so and emit a single item.

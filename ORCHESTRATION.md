@@ -188,6 +188,39 @@ From SWE-AF.
 integration. Multi-level DAGs are a generalisation to add once the loop works
 end to end.
 
+### Item size is a measured trade-off
+
+Two costs pull in opposite directions, and both have numbers:
+
+| too many items | too few items |
+|---|---|
+| coordination overhead, more branches to merge, more boundaries to disagree at | prompt cost grows **quadratically** with iteration count |
+
+History is append-only and re-sent whole on every call. A 21-iteration run
+billed 411,469 prompt tokens for a conversation whose final size was 33,678 —
+92% re-sent history. Three seven-iteration jobs cost dramatically less than
+one twenty-one-iteration job doing the same work.
+
+**Rule of thumb: an item should complete in roughly 5-10 tool-using
+iterations.** Cannot see how it finishes in that many? Split it. Two items
+that each take two steps? Merge them.
+
+`--keep-recent-turns` (default 3) elides stale tool results from what is sent
+and recovers part of the overhead directly; see SPEC.md's amendment. It
+reduces the penalty but does not remove it, so item sizing still matters.
+
+### Write task text that makes the job act, not explore
+
+The dominant observed failure is a job that reads exhaustively and never
+writes. One run made 31 `read_file` calls, zero `write_file` calls, and
+exhausted its budget having produced nothing. The identical task — with the
+contracts pasted into the task text and an explicit "write code early, read at
+most 2 files" instruction — committed 14 files.
+
+Discovery the planner has already done must not be paid for again by every
+job. Paste in the interfaces and constants, name the two or three files worth
+reading, and say not to explore past them.
+
 **The context bottleneck lives here.** `codemason` accepts exactly one input
 channel for context: the `--task` string, plus whatever is on disk in the
 repository it is pointed at. Everything the planner knows — the interface a

@@ -81,6 +81,7 @@ fn ac7_loop_calls_context_search_before_read_file_and_terminates() {
         budget_tokens: 200_000,
         budget_usd: None,
         dry_run: false,
+        keep_recent_turns: 0,
     };
 
     let (exit, _ledger) = run_loop(&cfg, &client, &index, &mut log);
@@ -157,6 +158,7 @@ fn ac8_malformed_and_unknown_tool_calls_continue_without_panicking() {
         budget_tokens: 200_000,
         budget_usd: None,
         dry_run: false,
+        keep_recent_turns: 0,
     };
 
     let (exit, _ledger) = run_loop(&cfg, &client, &index, &mut log);

@@ -684,6 +684,53 @@ none. `files_changed` and `commit` are what happened; `summary` is what the
 model claims happened. Anything automated should treat it as a log line, not
 as evidence.
 
+## Amendment: eliding stale tool results
+
+**Status:** accepted after M1, on measured evidence from a real run. This
+amends the Must Not entry "Truncate, summarise or otherwise manage
+conversation context", and narrows rather than removes it.
+
+**The measurement.** A 21-iteration run against a real repository billed
+411,469 prompt tokens for a conversation whose final size was 33,678 — **92%
+of the spend was re-sending history**. History is append-only and re-sent
+whole on every call, so prompt cost grows quadratically with iteration count.
+The same run came in at 0.71x list price, so provider-side prompt caching was
+already recovering roughly a third of it; caching is the provider's choice,
+though, and it does not shrink the context window.
+
+**Why the original rule was right about what it aimed at.** Summarising a
+conversation loses what the agent decided and why. An agent that silently
+forgets a constraint it accepted four turns ago fails in a way that is close
+to undebuggable, and no exit code can express it.
+
+**What is permitted instead.** Only stale `tool` results are elided, and only
+from what goes on the wire:
+
+- Every assistant message is kept in full, forever. The decision chain is
+  precisely what must not be lost.
+- The system prompt and the task are kept in full, forever. They are also the
+  cache prefix; disturbing them would cost more than it saves.
+- Tool results within the last `--keep-recent-turns` assistant turns
+  (default 3) are kept verbatim.
+- Older tool results are replaced by a placeholder naming the tool, stating
+  the byte count, and telling the model it may call the tool again.
+- Nothing is summarised, rewritten or reordered. `history` itself is never
+  mutated — only the copy sent to the provider — so the run's own record and
+  its event log stay complete.
+
+**Recoverability is the point.** An elided result the model still needs can be
+fetched again with one tool call. That is the difference between eliding and
+forgetting, and it is why this is not the thing the Must Not entry forbade.
+
+`--keep-recent-turns 0` disables it and restores the previous behaviour
+exactly.
+
+**Also added:** `cached_tokens` and `cache_discount` are now read from the
+provider's usage object when reported, and `cached_tokens` is recorded on each
+`llm_call` event. Cache savings were previously only inferable by comparing
+cost against list price. Measured, never estimated — absent when the provider
+says nothing.
+
 ## Milestone Validation
 
 M1 is complete when:

@@ -80,6 +80,7 @@ pub mod event_type {
     pub const LLM_CALL: &str = "llm_call";
     pub const TOOL_CALL: &str = "tool_call";
     pub const TOOL_RESULT: &str = "tool_result";
+    pub const CONTEXT_ELIDED: &str = "context_elided";
     pub const USAGE_MISSING: &str = "usage_missing";
     pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
     pub const MAX_ITERATIONS_EXCEEDED: &str = "max_iterations_exceeded";
