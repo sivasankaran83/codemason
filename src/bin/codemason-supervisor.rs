@@ -315,33 +315,53 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
         // otherwise the level's own items supply it. A level whose items
         // disagree about how to prove themselves is a planning error, and
         // saying so beats silently picking one.
-        let mut item_gates: Vec<&str> = items
+        let mut item_gates: Vec<String> = items
             .iter()
             .filter_map(|i| i.acceptance.as_deref())
-            .map(|s| s.trim())
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        item_gates.sort_unstable();
+        item_gates.sort();
         item_gates.dedup();
-        if item_gates.len() > 1 && acceptance.is_none() {
-            eprintln!(
-                "level {level}: items disagree on the acceptance command ({} distinct);                  using the first. Pass --acceptance to settle it.",
-                item_gates.len()
-            );
-        }
-        let level_gate: Option<String> = acceptance
-            .clone()
-            .or_else(|| item_gates.first().map(|s| s.to_string()));
 
-        let Some(command) = level_gate.as_deref() else {
-            eprintln!("level {level}: merged {} branch(es); no --acceptance, not verified", branches.len());
-            memory.append(Fact::note(None, format!("level {level} merged without verification")))?;
-            continue;
+        // `--acceptance` overrides everything. Otherwise EVERY distinct gate
+        // the level's items named is run, and all of them must pass.
+        //
+        // Running only the first was the earlier behaviour and it was wrong
+        // in the worst available way: a level of two items with two different
+        // per-project build commands reported success having verified one of
+        // them. A gate that is not run is not a gate, and a supervisor that
+        // reports work it never tested is worse than one with no gate at all,
+        // because the report is believed.
+        let gates: Vec<String> = match acceptance.clone() {
+            Some(global) => vec![global],
+            None => item_gates,
         };
+
+        if gates.is_empty() {
+            eprintln!(
+                "level {level}: merged {} branch(es); no acceptance command, not verified",
+                branches.len()
+            );
+            memory.append(Fact::note(
+                None,
+                format!("level {level} merged without verification"),
+            ))?;
+            continue;
+        }
+        eprintln!("level {level}: {} acceptance command(s) to satisfy", gates.len());
 
         let mut cycle = 0u32;
         loop {
-            let verification = run_acceptance(&repo, command)?;
+            // First failure decides the cycle: a level is only accepted when
+            // every one of its gates passes.
+            let mut verification = run_acceptance(&repo, &gates[0])?;
+            for gate in gates.iter().skip(1) {
+                if !verification.passed {
+                    break;
+                }
+                verification = run_acceptance(&repo, gate)?;
+            }
             memory.append(Fact::errors(
                 &format!("level-{level}"),
                 cycle,
