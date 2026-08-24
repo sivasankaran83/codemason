@@ -45,6 +45,41 @@ is unverified; see [Container](#container) below. See `SPEC.md` for scope,
 work packages and acceptance criteria, and `CLAUDE.md` for how work proceeds
 in this repository.
 
+## Where codemason sits
+
+`codemason` is the **executor**. It runs one task against one repository and
+knows nothing about orchestration — the stdout JSON and the exit codes are its
+entire interface upward. Everything else in the diagram below belongs to a
+supervisor above it.
+
+The supervisor's loop follows AgentFlow (arXiv:2510.05592): four modules —
+planner, executor, verifier, generator — coordinated by an evolving memory
+across turns. Mapped onto the six pipeline stages:
+
+```
+                                        AgentFlow module
+1. ANALYZE     dependency graph              --            setup
+2. PARTITION   disjoint file ownership       --            setup
+   ----------------------------------------------------------------
+3. PLAN        work items -> DAG -> levels   planner     \
+4. EXECUTE     N concurrent codemason runs   executor     |  the loop
+5. INTEGRATE   merge, test, bounded fix      verifier     |
+6. REPORT      cost, status, provenance      generator   /
+   ----------------------------------------------------------------
+            evolving memory spans 3-6 and persists across cycles
+```
+
+Stages 1 and 2 run once per build and are already in this binary
+(`codemason index --graph` and `--partition`). Stage 4 is `codemason run`
+itself. Stages 3, 5 and 6 live above it.
+
+The evolving memory matters because every `codemason` process is stateless by
+design: task in, commit, exit, remembers nothing. Without a memory in the
+supervisor, two consecutive attempts at a failing item start equally blind.
+
+See `ORCHESTRATION.md` for the full design, what to build and what not to, and
+the measured evidence behind both.
+
 ## Running jobs in parallel
 
 One process handles one job. How you isolate those processes depends on
