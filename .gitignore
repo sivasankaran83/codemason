@@ -1,1 +1,9 @@
 /target
+
+# Local credentials — never committed. `.env.example` is the template.
+.env
+.env.*
+!.env.example
+
+# The runner's own working area inside a target repository.
+.agent/

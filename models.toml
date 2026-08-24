@@ -1,14 +1,44 @@
-# Placeholder ids. Real ids MUST be validated with `codemason models --check`
-# before use — this file is not fetched or trusted blindly. The first
-# [[model]] entry is the default used when `codemason run` is given no
-# --model flag.
+# Operator allowlist, in preference order. The first [[model]] entry is the
+# default used when `codemason run` is given no --model flag.
+#
+# These ids were taken from the live OpenRouter catalogue and validated with
+# `codemason models --check` (all three pass the gate: native tool-calling
+# support, context length above the minimum below, not a router pseudo-model).
+# Re-run that check before trusting this file — provider catalogues change,
+# ids get deprecated, and a stale id fails at the gate rather than silently
+# falling back.
+#
+# Prices below are USD per million tokens (input/output) at the time of
+# validation, recorded to make the cost ordering reviewable — the runner
+# never estimates cost, it only reports what the provider returns.
 
+# Cheapest capable coder. Strong on code, 163k context, ~4x cheaper on
+# output than the OpenAI options here. Sensible default for unattended runs.
 [[model]]
-id = "REPLACE_ME/example-primary-model"
+id = "deepseek/deepseek-v3.2"          # $0.26 in / $0.38 out
 role = "primary"
 
+# OpenAI's coding-tuned small model. Different vendor to the primary, which
+# is the point — M1's premise is vendor independence, so the fallback should
+# not share a failure mode with the default.
 [[model]]
-id = "REPLACE_ME/example-fallback-model"
+id = "openai/gpt-5.1-codex-mini"       # $0.25 in / $2.00 out
+role = "fallback"
+
+# Third vendor, for the vendor-independence check M1 is built to make.
+# MiniMax's M2 line is agentic/coding-tuned; m2.7 is the newest and the
+# cheapest of that line. Note that not every MiniMax id is usable here —
+# `minimax-01` and `minimax-m2-her` do not advertise tool support and are
+# refused at the gate, correctly.
+[[model]]
+id = "minimax/minimax-m2.7"            # $0.24 in / $0.96 out
+role = "fallback"
+
+# Known-good in this repository: this is the model WP3's live AC7 run used.
+# It works, with one recorded quirk — it reached for `list_files` before
+# `context_search` when asked to describe repository structure.
+[[model]]
+id = "openai/gpt-4o-mini"              # $0.15 in / $0.60 out
 role = "fallback"
 
 [gating]

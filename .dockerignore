@@ -1,7 +1,17 @@
+# Credentials must never enter the build context. The Dockerfile does not
+# COPY them, but anything in the context is sent to the daemon and can be
+# recovered from build cache — keep them out entirely.
+.env
+.env.*
+*.key
+*.pem
+
 /target
-old_source/
 .git
 .gitignore
 tests/
 *.md
 models.toml
+.agent/
+Dockerfile
+.dockerignore

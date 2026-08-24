@@ -96,6 +96,18 @@ fn models_command() -> Command {
                 .long("check")
                 .action(ArgAction::SetTrue),
         )
+        // SPEC.md T2.2 states one resolution order for `models.toml`
+        // (`--models-config`, then `./models.toml`, then the platform config
+        // directory) without scoping it to a subcommand. `run` accepted the
+        // flag from WP2 but `models` did not, which left `models --check` —
+        // the command whose whole purpose is validating an allowlist —
+        // unable to validate any allowlist other than the one the current
+        // working directory happened to resolve to.
+        .arg(
+            Arg::new("models-config")
+                .long("models-config")
+                .value_name("PATH"),
+        )
 }
 
 fn index_command() -> Command {

@@ -45,6 +45,28 @@ is unverified; see [Container](#container) below. See `SPEC.md` for scope,
 work packages and acceptance criteria, and `CLAUDE.md` for how work proceeds
 in this repository.
 
+## Web search
+
+`web_search` is the seventh tool, added by a recorded amendment to `SPEC.md`
+after M1 (see "Amendment: the seventh tool" there for the reasoning and the
+cost). It is provider-agnostic — no vendor is compiled into the binary:
+
+```
+CODEMASON_SEARCH_URL=https://api.search.brave.com/res/v1/web/search
+CODEMASON_SEARCH_API_KEY=<key>
+CODEMASON_SEARCH_KEY_HEADER=X-Subscription-Token   # optional; this is the default
+```
+
+Brave (2,000 queries/month), Tavily (1,000) and Serper (2,500) all have free
+tiers. The response is parsed structurally rather than against one vendor's
+schema, so any provider returning JSON with title/url/description-shaped
+results works.
+
+With no provider configured it falls back to a keyless DuckDuckGo endpoint.
+That fallback is **best-effort and will fail intermittently** — the endpoint
+rate-limits and answers with an HTTP 202 challenge page rather than results.
+Configure a provider for anything that matters.
+
 ## Exit codes
 
 These are a contract — a supervisor dispatches on them.
@@ -83,16 +105,16 @@ immediate second run against the same repository.
 
 | repository | indexed files | chunks | cold | warm |
 |---|---|---|---|---|
-| `buildsmith` (C#) | 18 | 95 | 329 ms | 53 ms |
-| `CapaFabric` (Go + C#) | 66 | 121 | 1,198 ms | 126 ms |
-| `CodeFabric` (Go, Rust, TypeScript, SQL — largest available) | 214 | 879 | 4,503 ms | 1,348 ms |
+| small (C#) | 18 | 95 | 329 ms | 53 ms |
+| medium (Go + C#) | 66 | 121 | 1,198 ms | 126 ms |
+| large (Go, Rust, TypeScript, SQL — largest available) | 214 | 879 | 4,503 ms | 1,348 ms |
 
 **Decision: build in-memory per run, do nothing further.** Even the largest
 repository available for measurement builds in 4.5 s cold, comfortably inside
 T5.1's "under ~5 s" threshold. Index persistence (a versioned on-disk format,
-`--out`/`--index` flags) is not worth building for M1 — revisit only if a
-repository an order of magnitude larger than `CodeFabric` becomes the norm, or
-if parallel job counts make repeated cold builds visible in practice.
+`--out`/`--index` flags) is not worth building for M1 — revisit only if
+repositories an order of magnitude larger become the norm, or if parallel job
+counts make repeated cold builds visible in practice.
 
 ## Container
 

@@ -52,8 +52,9 @@ One process, one job, one repository. Parallelism is N processes.
   chunking, ranking or the dependency graph.
 - Construct the index with `encoder: None`; feature-gate the encoder off by
   default so the embedding and array crates leave the build.
-- Expose **at most six** tools, with flat argument schemas — strings and
-  integers only, no nested objects, no arrays of objects.
+- Expose **at most seven** tools (six through M1; see "Amendment: the seventh
+  tool"), with flat argument schemas — strings and integers only, no nested
+  objects, no arrays of objects.
 - Enforce a two-layer model gate before the first completion call.
 - Refuse any model whose catalogue entry does not advertise native tool-calling
   support. No flag bypasses this.
@@ -600,6 +601,41 @@ deferred.
 - **AC4** Two concurrent runs against two clones succeed independently.
 
 ---
+
+## Amendment: the seventh tool
+
+**Status:** accepted after M1's five packages reached their gates. Recorded
+here rather than applied silently, because "at most six tools" was stated
+three times in this document as load-bearing and a number that moves without
+a written reason is a number that keeps moving.
+
+`web_search` is added, raising the cap from six to seven.
+
+**What it does.** `web_search(query, max_results)` — flat schema, string and
+integer, consistent with every other tool. Provider-agnostic for the same
+reason the model client is: an endpoint and key are read from
+`CODEMASON_SEARCH_URL` and `CODEMASON_SEARCH_API_KEY`, and the response is
+read structurally rather than against one vendor's schema. No new crate
+enters the tree — `ureq` and `regex` are already pinned dependencies. With no
+provider configured it falls back to a keyless DuckDuckGo endpoint that is
+explicitly **best-effort**: that endpoint rate-limits and answers HTTP 202
+with a challenge page often enough that nothing should depend on it.
+
+**Why it earns the slot.** The engine answers "what is in this repository".
+Nothing answered "what does this library's API look like" or "what does this
+compiler error mean", and a model that cannot look those up guesses instead —
+which costs iterations against exactly the budget this binary exists to
+protect.
+
+**What it costs, stated plainly.** The original reasoning still holds: every
+additional tool costs accuracy on weaker models, and tool count is where
+cheap models degrade first. Seven is a budget, not a formality. The tool
+description steers explicitly away from `context_search`'s territory
+("never use it to look for code that is in the repository") because
+overlapping discovery tools are precisely the confusion the cap exists to
+prevent. If measurement shows weaker models reaching for `web_search` when
+they should be searching the repository, the correct response is to remove it
+again, not to add an eighth tool to compensate.
 
 ## Milestone Validation
 

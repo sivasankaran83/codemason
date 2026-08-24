@@ -1,10 +1,16 @@
 //! The tool registry — the only place in this binary aware of the tool
-//! list. At most six tools, flat schemas: string and integer properties
+//! list. At most seven tools, flat schemas: string and integer properties
 //! only, no nested objects, no arrays of objects.
+//!
+//! The cap was six through WP1–WP5 and was raised to seven by a deliberate,
+//! recorded spec amendment when `web_search` was added — see SPEC.md's
+//! "Amendment: the seventh tool". The cap still binds: it is a budget, not
+//! a formality, because tool count is where weaker models degrade first.
 
 pub mod context;
 pub mod exec;
 pub mod fs;
+pub mod web;
 
 use std::path::Path;
 
@@ -48,8 +54,8 @@ pub struct ToolSpec {
     pub schema: serde_json::Value,
 }
 
-/// The full, fixed six-tool surface, in the order SPEC.md's T3.3 table
-/// lists them.
+/// The full, fixed seven-tool surface: SPEC.md's T3.3 table in its stated
+/// order, followed by `web_search` from the recorded amendment.
 pub fn registry() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -125,6 +131,18 @@ pub fn registry() -> Vec<ToolSpec> {
                 "required": ["command"]
             }),
         },
+        ToolSpec {
+            name: "web_search",
+            description: "Search the web for information not in this repository, such as library documentation or error messages. Prefer context_search for anything inside the repository.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"},
+                    "max_results": {"type": "integer", "description": "Maximum results to return; 0 uses a default"}
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -190,6 +208,13 @@ struct RunCommandArgs {
     timeout_seconds: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    #[serde(default)]
+    max_results: i64,
+}
+
 fn parse_and_run<T: DeserializeOwned>(
     args_json: &str,
     f: impl FnOnce(T) -> ToolOutcome,
@@ -222,6 +247,9 @@ pub fn dispatch(name: &str, args_json: &str, ctx: &ToolContext) -> DispatchResul
         "run_command" => parse_and_run::<RunCommandArgs>(args_json, |a| {
             exec::run_command(ctx, &a.command, a.timeout_seconds)
         }),
+        "web_search" => parse_and_run::<WebSearchArgs>(args_json, |a| {
+            web::web_search(&a.query, a.max_results)
+        }),
         _ => DispatchResult::UnknownTool,
     }
 }
@@ -235,7 +263,10 @@ mod tests {
     #[test]
     fn every_schema_is_flat_string_or_integer_only() {
         let tools = registry();
-        assert!(tools.len() <= 6, "at most six tools");
+        // Raised from six by the recorded amendment that added web_search.
+        // Still a hard cap, and still the thing that keeps this binary
+        // usable on cheap models — see SPEC.md before raising it again.
+        assert!(tools.len() <= 7, "at most seven tools");
 
         for tool in &tools {
             let properties = tool.schema.get("properties").unwrap_or_else(|| {

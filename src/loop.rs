@@ -54,11 +54,31 @@ fn budget_breached(cfg: &LoopConfig, ledger: &UsageLedger) -> bool {
     ledger.total_tokens() >= cfg.budget_tokens
 }
 
+/// Deliberately short. Two of these paragraphs are required by SPEC.md and
+/// were specified but not written when their packages landed: T4.1's
+/// "`write_file` requires complete file content" and T4.2's "verify work by
+/// running the project's build or test command before finishing".
+///
+/// The stopping rule is stated explicitly because the failure it prevents
+/// was observed in a live run: a model finished the task correctly, then
+/// spent every remaining iteration re-reading files it had already read and
+/// exited on the iteration ceiling instead of with a summary.
 fn system_prompt(repo_root: &std::path::Path) -> String {
     format!(
         "You are operating on a git repository at {}. Start discovery with \
-         context_search, then context_outline, then read_file. When you are \
-         finished, reply with a summary and no tool calls.",
+         context_search, then context_outline, then read_file. Use web_search \
+         only for information outside this repository, such as library \
+         documentation; never use it to look for code that is in the \
+         repository.\n\n\
+         write_file replaces a whole file. Always supply the complete file \
+         content, never a fragment and never a placeholder such as \
+         \"// ... rest unchanged\" — content that elides code is rejected.\n\n\
+         Before finishing, verify your work by running the project's build or \
+         test command with run_command.\n\n\
+         Stop as soon as the task is done and your verification has passed. \
+         Do not re-read files you have already read, and do not repeat a \
+         search you have already run. To finish, reply with a summary and no \
+         tool calls.",
         normalize_slashes(&repo_root.to_string_lossy())
     )
 }

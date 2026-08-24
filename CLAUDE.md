@@ -97,10 +97,12 @@ Enforced by acceptance criteria — check before proposing a dependency.
 
 ## Design invariants
 
-- **At most six tools, flat schemas.** Strings and integers only, no nested
+- **At most seven tools, flat schemas.** Strings and integers only, no nested
   objects, no arrays of objects. The binary exists to run cheap models, and tool
   count and schema depth are where they degrade first. Adding a tool needs a
-  spec change, not a judgement call.
+  spec change, not a judgement call. The cap was six through M1 and was raised
+  to seven for `web_search` by a written amendment in SPEC.md — follow that
+  precedent rather than treating the number as soft.
 - **The model gate has no bypass for tool-calling support.** A model that cannot
   call tools cannot finish a run; letting it start wastes money.
 - **Budget is checked before each API call, never after.** Checking after means

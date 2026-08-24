@@ -232,7 +232,10 @@ fn commit_message_for(task: &str) -> String {
 }
 
 fn models_cmd(sub: &clap::ArgMatches) -> ExitCode {
-    let (config_path, models_config) = match config::resolve(None) {
+    let explicit = sub
+        .get_one::<String>("models-config")
+        .map(std::path::PathBuf::from);
+    let (config_path, models_config) = match config::resolve(explicit.as_deref()) {
         Ok(resolved) => resolved,
         Err(err) => {
             eprintln!("error: {err}");
