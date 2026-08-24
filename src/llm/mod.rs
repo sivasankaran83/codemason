@@ -168,4 +168,16 @@ impl UsageLedger {
     pub fn totals(&self) -> &HashMap<String, Totals> {
         &self.by_model
     }
+
+    /// Cumulative tokens spent across every model — what the budget check
+    /// compares `LoopConfig::budget_tokens` against.
+    pub fn total_tokens(&self) -> u64 {
+        self.by_model.values().map(|t| t.total_tokens).sum()
+    }
+
+    /// Cumulative cost across every model, from whatever the provider
+    /// actually reported — never estimated.
+    pub fn total_cost(&self) -> f64 {
+        self.by_model.values().map(|t| t.cost).sum()
+    }
 }

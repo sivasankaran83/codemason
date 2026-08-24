@@ -62,6 +62,7 @@ fn ac9a_completed_run_log_has_contiguous_seq_and_required_types() {
     fs::write(cwd.join("a.rs"), "fn main() {}\n").unwrap();
     let model_id = "vendor/log-model";
     write_models_toml(&cwd, model_id);
+    common::init_git_repo(&cwd);
 
     let mut routes = HashMap::new();
     routes.insert("/models", vec![StubResponse::json(200, catalogue_body(model_id))]);
@@ -91,7 +92,7 @@ fn ac9a_completed_run_log_has_contiguous_seq_and_required_types() {
             "--log",
             log_path.to_str().unwrap(),
         ])
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache"))
+        .env("CODEMASON_CACHE_DIR", temp_dir("event-log-full-run-cache"))
         .output()
         .expect("run codemason run");
 
@@ -131,6 +132,7 @@ fn ac9b_killing_mid_run_leaves_complete_lines_parseable() {
     fs::write(cwd.join("a.rs"), "fn main() {}\n").unwrap();
     let model_id = "vendor/kill-model";
     write_models_toml(&cwd, model_id);
+    common::init_git_repo(&cwd);
 
     // A long run of identical tool-call turns, each delayed, so the process
     // is still going when the test kills it.
@@ -159,7 +161,7 @@ fn ac9b_killing_mid_run_leaves_complete_lines_parseable() {
             "--log",
             log_path.to_str().unwrap(),
         ])
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache"))
+        .env("CODEMASON_CACHE_DIR", temp_dir("event-log-kill-cache"))
         .spawn()
         .expect("spawn codemason run");
 

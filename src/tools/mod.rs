@@ -3,6 +3,7 @@
 //! only, no nested objects, no arrays of objects.
 
 pub mod context;
+pub mod exec;
 pub mod fs;
 
 use std::path::Path;
@@ -17,6 +18,7 @@ use crate::llm;
 pub struct ToolContext<'a> {
     pub repo_root: &'a Path,
     pub index: &'a Index,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,9 +49,7 @@ pub struct ToolSpec {
 }
 
 /// The full, fixed six-tool surface, in the order SPEC.md's T3.3 table
-/// lists them. `write_file` and `run_command` are registered here with real
-/// schemas even though their handlers are WP4 stubs — the registry's shape
-/// does not change between WP3 and WP4, only the two handlers do.
+/// lists them.
 pub fn registry() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -169,9 +169,7 @@ struct ReadFileArgs {
 
 #[derive(Debug, Deserialize)]
 struct WriteFileArgs {
-    #[allow(dead_code)]
     path: String,
-    #[allow(dead_code)]
     content: String,
 }
 
@@ -187,9 +185,7 @@ struct ListFilesArgs {
 
 #[derive(Debug, Deserialize)]
 struct RunCommandArgs {
-    #[allow(dead_code)]
     command: String,
-    #[allow(dead_code)]
     #[serde(default)]
     timeout_seconds: i64,
 }
@@ -217,14 +213,14 @@ pub fn dispatch(name: &str, args_json: &str, ctx: &ToolContext) -> DispatchResul
         "read_file" => parse_and_run::<ReadFileArgs>(args_json, |a| {
             fs::read_file(ctx, &a.path, a.start_line, a.end_line)
         }),
-        "write_file" => parse_and_run::<WriteFileArgs>(args_json, |_a| {
-            ToolOutcome::Error("write_file is not available until WP4".to_string())
+        "write_file" => parse_and_run::<WriteFileArgs>(args_json, |a| {
+            fs::write_file(ctx, &a.path, &a.content)
         }),
         "list_files" => parse_and_run::<ListFilesArgs>(args_json, |a| {
             fs::list_files(ctx, &a.path, &a.pattern, a.max_results)
         }),
-        "run_command" => parse_and_run::<RunCommandArgs>(args_json, |_a| {
-            ToolOutcome::Error("run_command is not available until WP4".to_string())
+        "run_command" => parse_and_run::<RunCommandArgs>(args_json, |a| {
+            exec::run_command(ctx, &a.command, a.timeout_seconds)
         }),
         _ => DispatchResult::UnknownTool,
     }
@@ -287,6 +283,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &dir,
             index: &index,
+            dry_run: false,
         };
         assert!(matches!(dispatch("nonexistent_tool", "{}", &ctx), DispatchResult::UnknownTool));
     }
@@ -300,6 +297,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &dir,
             index: &index,
+            dry_run: false,
         };
         assert!(matches!(
             dispatch("read_file", "not json", &ctx),

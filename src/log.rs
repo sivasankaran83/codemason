@@ -71,10 +71,7 @@ impl EventLog {
     }
 }
 
-/// Event type name constants — the fixed set SPEC.md's T3.5 declares. Not
-/// every one is emitted yet: `budget_exceeded`/`max_iterations_exceeded`
-/// describe enforcement WP4 adds; the names exist here now so WP4 only has
-/// to add call sites, not a new type.
+/// Event type name constants — the fixed set SPEC.md's T3.5 declares.
 pub mod event_type {
     pub const RUN_STARTED: &str = "run_started";
     pub const INDEX_BUILT: &str = "index_built";

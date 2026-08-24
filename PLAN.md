@@ -1,442 +1,400 @@
-# PLAN.md — WP3: Client, tools, loop
+# PLAN.md — WP4: Writes, commands, git, budget
 
 ## Scope (restated)
 
-The read-only agent. No writes, no commands, no git — those are WP4. Five
-tasks:
+Everything that changes state. Four tasks:
 
-- **T3.1** Blocking LLM client: OpenAI-compatible chat completions, retry on
-  429/5xx with backoff+jitter, usage/cost accumulation keyed by model id,
-  never estimate cost the provider didn't report.
-- **T3.2** Path safety (traversal rejection, Windows long paths) and text
-  handling (line-ending/BOM detect-and-restore, elision detection, stdout
-  UTF-8).
-- **T3.3** Six tools, flat string/int schemas, one registry as the sole
-  source of truth for the tool list.
-- **T3.4** The tool-calling loop: seed system+task, call model, execute tool
-  calls in order, append one `tool` message per call, repeat; terminate on an
-  assistant message with no tool calls. In-loop error handling for malformed
-  args / unknown tool / missing usage — none of it retries the API call.
-- **T3.5** Append-only JSONL event log, flushed after every write, fixed
-  envelope and type set, no payload contents.
+- **T4.1** `write_file`: whole-file replacement, creates parent dirs/file if
+  absent, applies WP3's line-ending/BOM restoration against whatever
+  convention the file currently has on disk. Rejects (as a tool-result error,
+  never a failed run): content over 500 KB, a path outside the repo root,
+  content that looks elided, or any attempt under `--dry-run`.
+- **T4.2** `run_command`: runs at the repo root via the platform shell,
+  default timeout 120 s / max 900 s, kills the **full process tree** on
+  timeout, captures interleaved stdout+stderr capped at the last 100 KB,
+  always returns the real exit code as a normal (non-error) result, refuses
+  under `--dry-run`. No allowlist — the container + disposable repo copy is
+  the isolation boundary (already documented in README.md's Safety section).
+- **T4.3** Git: one module owns every repository operation. Preflight
+  (git-worktree + clean check, refuse dirty unless `--dry-run`, exit 1 before
+  any API call), branch create/checkout, postflight (stage, commit only if
+  something changed, capture SHA + changed paths).
+- **T4.4** Budget/ceiling/report: check token *and* USD budget immediately
+  before each API call, never after; refuse to start at budget `0`/`<=0`;
+  enforce the iteration ceiling (unenforced since WP3); on breach, log, break,
+  commit partial work, exit 2 or 3; emit exactly one JSON report object on
+  stdout for every exit path of `run`, diagnostics to stderr.
 
-Gate: AC7 ("describe the structure of this repository" completes, uses
-`context_search` before `read_file`, terminates with a summary) is called out
-in SPEC.md as the first test of the whole project's premise.
+Gate: none named specifically for WP4 in SPEC.md's per-package callouts (that
+was WP1/AC7 and WP3/AC7) — all nine ACs below are equally load-bearing this
+package.
 
 ## Feasibility findings
 
-None of WP3's target files exist yet (`src/llm/`, `src/text.rs`,
-`src/tools/`, `src/loop.rs`, `src/log.rs`) — expected, this package creates
-them.
+All WP4 target files from SPEC.md's file list exist in the state WP3 left
+them, confirmed by direct read, not assumption:
 
-Symbols WP3 depends on from WP1/WP2 all resolve as documented, confirmed by
-direct read rather than assumed:
+- `src/tools/mod.rs` — registry already declares all six schemas (`write_file`:
+  `path`+`content`; `run_command`: `command`+`timeout_seconds`); `dispatch`
+  currently routes both to a stub `ToolOutcome::Error("... not available until
+  WP4")`. This package swaps the two stub closures for real handlers; no
+  schema change.
+- `src/tools/fs.rs` — `read_file`/`list_files` are real; file header comment
+  already says `write_file` lands here and `run_command` in a new `exec.rs`.
+- `src/loop.rs` — `LoopConfig.max_iterations` exists but is
+  `#[allow(dead_code)]`, read by nothing (WP3's own comment: "T4.4 owns...
+  this field is not read by `run` yet"). `LoopExit` has two variants
+  (`Completed`, `ProviderError`); WP4 adds `BudgetExceeded` and
+  `MaxIterationsExceeded`. The per-tool-call `ToolContext` is built inline at
+  `src/loop.rs:144`; needs a `dry_run` field threaded from `LoopConfig`.
+- `src/error.rs` — `ProviderExhausted`/`ProviderRequest`/`PathEscapesRepo`
+  already present from WP3; no git or budget variants yet.
+- `src/cli.rs` — `RunArgs` already carries `budget_tokens: u64`,
+  `budget_usd: Option<f64>`, `max_iterations: u32`, `branch: Option<String>`,
+  `dry_run: bool` — every flag T4.4/T4.3 need is already parsed. No CLI
+  surface change needed this package.
+- `src/bin/codemason.rs`'s `run_cmd` currently: parses args → resolves
+  config/model → resolves credentials → fetches catalogue → gates → opens the
+  event log → builds the index → constructs the client → runs the loop →
+  `eprintln!`s the summary. No git preflight, no branch, no postflight commit,
+  no budget threading, no stdout JSON report — this package's real surface.
+- `src/repo.rs` does not exist. `src/tools/exec.rs` does not exist. Both
+  expected — this package creates them.
+- No new crate is needed. Git operations shell out to the `git` CLI (present:
+  `git version 2.52.0.windows.1`) via `std::process::Command`, matching the
+  existing pattern (`gating.rs` shells to nothing but the client already uses
+  `ureq`; git needs no client library per the Must Not list). Process-tree
+  kill on Windows shells to `taskkill /PID <pid> /T /F`, also no new
+  dependency. Neither needs `unsafe_code`, which stays denied.
+- `git status --porcelain=v1` on this repo returns nothing (clean) — the
+  precondition for starting work is met.
 
-- `codemason_core::index::Index::{build, search, chunks, graph, stats}` —
-  `search(&self, query: &str, top_k: usize) -> Vec<SearchResult>` (WP1's
-  wrapper hardcodes `alpha`/`filter_languages`/`filter_paths` to `None`,
-  matching `context_search`'s flat `query`/`max_results` schema with no
-  extra knobs to expose).
-- `engine::graph::DependencyGraph::{deps, dependents}` —
-  `deps(&self, file_path: &str) -> Option<&FileNode>` where `FileNode` carries
-  `symbols: Vec<Symbol{name, kind, line}>` and `depends_on: Vec<String>`;
-  `dependents(&self, file_path: &str) -> Vec<&str>`. This is what
-  `context_outline` reads for a file's symbol list, and what
-  `context_search` folds in as related paths (SPEC.md: "Fold
-  dependency-graph information into `context_search` results as related
-  paths" instead of separate dependency/impact tools).
-- `engine::types::{Chunk, SearchResult, MatchLine}`, `Chunk::location()` →
-  `"path:start-end"`.
-- `engine::file_walker::{walk_files, default_ignored_dirs}` and the `ignore`
-  crate's `WalkBuilder`/`OverrideBuilder` (already a pinned dependency, used
-  the same way inside `engine::file_walker`) — `list_files` reuses this
-  pattern directly rather than the engine's extension-filtered
-  `walk_files` (list_files must list *any* file, not just recognized source
-  extensions).
-- `cli::{RunArgs, ExitCode, resolve_credential}`, `config::ModelsConfig`,
-  `gating::{catalogue, check}`, `error::Error` — `bin/codemason.rs`'s
-  `run_cmd` currently stops right after gating passes
-  (`"execution loop is not implemented until WP3"`); WP3 replaces that stub
-  with the real build-index → construct-client → run-loop → emit-log
-  sequence.
-- `tests/common::StubServer` exists but only serves one fixed 200 response to
-  every request regardless of path — insufficient for WP3's retry tests
-  (429/429/200, 500×5) and for driving a full `run` invocation through both
-  `GET /models` (gating) and `POST /chat/completions` (the loop). Extending
-  it, not replacing it — `tests/gating.rs`'s existing use of
-  `StubServer::start` must keep compiling unchanged.
-
-New dependencies needed, neither in the current dependency tree as a direct
-dep:
-
-- `uuid = "=1.25.0"`, feature `v7`, for the event log's `run_id`. Not present
-  even transitively — `cargo add uuid --features v7 --dry-run` resolves
-  1.25.0 against the existing lockfile.
-- `rand = "=0.9.5"` — **already** in the tree transitively (`model2vec-rs` →
-  `hf-hub`/`tokenizers` → `rand`, confirmed via `cargo tree -i rand`; note
-  `model2vec-rs` is always-compiled per WP1's `Cargo.toml` comment, so this
-  is not a new resolution, only a promotion to direct dependency, same move
-  WP2 made for `clap`/`ureq`). Used for retry-jitter, avoiding a hand-rolled
-  entropy source.
-
-`cargo tree` re-check after the two additions: still no `openssl`, `git2`,
-`tokio`/`async-std`, or embedding/array crates beyond the already-accepted
-`model2vec-rs`/`ndarray` pair from WP1. No contradiction with SPEC.md's
-Current State section. The package proceeds.
+No contradiction with SPEC.md's Current State section. The package proceeds.
 
 ## Ambiguity resolved at kickoff
 
-**Tool registry scope in WP3 vs WP4.** T3.3's table lists all six tools,
-`write_file` and `run_command` annotated "WP4", but WP3's own scope line says
-"no writes, no commands" and T3.3's file list has no `exec.rs`. Confirmed:
-**register all six schemas now**; `write_file`/`run_command` handlers return
-a descriptive "not available until WP4" tool-result error rather than acting
-— the model can read that and continue, per the errors-are-not-failures
-design invariant. This satisfies AC6 ("every tool's JSON schema...") against
-the full, final six-tool set from this package onward and matches the "at
-most six, fixed up front" framing in CLAUDE.md, rather than growing the
-registry's shape between packages. WP4 swaps the two stub handlers for real
-`fs.rs`/`exec.rs` logic without touching the schemas.
+**Budget refusal threshold (asked, not self-resolved).** T4.4's prose says
+"refuse to start when the budget is at or below zero," but AC8 says
+`--budget-tokens 1` exits 2 with **zero** API calls — and with 0 tokens spent
+before the first call, a strict `spent >= budget` check lets call #1 through
+(0 < 1); the breach is only visible before call #2. Asked the developer:
+**strict zero-only** confirmed. `refuse to start` fires only when
+`budget_tokens == 0` or `budget_usd <= Some(0.0)`. AC8's "zero calls" case is
+tested at `--budget-tokens 0`, not `1`; a separate test at a small nonzero
+budget (e.g. `1`) demonstrates one call happens, the breach is caught before
+call #2, and partial work is still committed — same protective behavior AC8
+describes, at the value the spec's own prose implies rather than the value
+its AC literally names. Flagged as a deviation from AC8's literal wording,
+not from its intent.
 
-## Other inferences (flagged, not asked — same treatment WP2 gave the
-`/models` endpoint path)
+## Other inferences (flagged, not asked — same treatment WP2/WP3 gave
+similar unspecified-but-not-contradictory details)
 
-1. **Chat completions endpoint & usage flag.** `POST {base_url}/chat/completions`,
-   OpenAI-compatible, mirroring WP2's `{base_url}/models` convention.
-   SPEC.md's "usage-inclusion flag" is read as OpenRouter's
-   `"usage": {"include": true}` request field — the one OpenRouter-specific
-   flag that both guarantees a `usage` block on a non-streaming response *and*
-   adds a provider-reported `cost` field, which is what makes "accumulate...
-   cost, keyed by model id" (T3.1) meaningful without ever estimating it
-   ourselves. Sent unconditionally; unknown fields are ignored by
-   OpenAI-compatible endpoints that don't recognize it.
-2. **Retry/backoff formula.** `delay = min(60s, base=1s * 2^attempt) + jitter`,
-   jitter drawn from `rand` (now a direct dep) as `0..=250ms`, attempts
-   capped at 5. Only `429` and `5xx` HTTP statuses retry; anything else
-   (4xx other than 429, connection failure) is a single-shot provider error.
-3. **Elision markers.** Case-insensitive substring match for the three
-   literal marker phrases from SPEC.md's own backticked text — `"... rest of"`,
-   `"unchanged"`, `"... existing"` — combined with the `new.len() <
-   existing.len() / 2` length check. `write_file` doesn't exist as working
-   code until WP4, but the detection function itself is T3.2's, tested
-   directly against strings.
-4. **Windows long-path support.** `std::fs::canonicalize` already returns
-   `\\?\`-prefixed verbatim paths on Windows, which is what actually lifts
-   the 260-char `MAX_PATH` limit — there is no additional opt-in needed, and
-   none is added. `text.rs`'s path-safety function canonicalizes before any
-   filesystem call, so this falls out for free. Verified by AC3's own test
-   (a path over 260 chars, read via this path).
-5. **Stdout UTF-8, without `unsafe_code`.** `unsafe_code = "deny"` is a lint
-   on *this crate's* code, not on dependencies, but pulling in a
-   console/terminal crate just to call `SetConsoleOutputCP` for one line is
-   more than this needs. Rust's `std::io::Stdout` on Windows already routes
-   through `WriteConsoleW` (UTF-16, codepage-independent) whenever stdout is
-   an actual console, and raw bytes whenever it's redirected to a file or
-   pipe (the JSON-report case, where codepage is irrelevant since the reader
-   decodes UTF-8 itself). "Set stdout to UTF-8 explicitly" is implemented as:
-   always write pre-encoded UTF-8 bytes via `write_all`, never anything
-   locale-dependent (`println!` with formatting that could go through a
-   lossy codec) — no FFI, no `unsafe`.
-6. **Default `--log` path when omitted.** `<repo>/.agent/log/run-<run_id>.jsonl`.
-   Not named in SPEC.md; inferred from T3.3's "Always excludes `.git/` and
-   `.agent/`" in `list_files`, which implies `.agent/` is this tool's own
-   working area inside the target repo. Parent directories created as
-   needed.
-7. **`--verbose`.** No WP3 acceptance criterion exercises it (WP4's AC9 only
-   asserts it adds nothing to *stdout*). Implemented as: echo each tool call
-   and its result's size/truncation to stderr as it happens. Low-risk,
-   reversible if this reads wrong at the gate.
-8. **`max_iterations` is threaded into `LoopConfig` but not enforced in
-   WP3.** T4.4 owns "enforce a hard iteration ceiling" and the exit-3
-   mapping; T3.4 defines no ceiling behaviour. The loop runs until a
-   no-tool-call message or one of T3.4's own abort conditions (three
-   consecutive same-tool parse failures, three consecutive missing-usage
-   responses) fires. No ad hoc cap is added in its place — that would be
-   guessing at WP4's contract. Practical effect: WP3's own automated tests
-   use finite fabricated stub traces, so nothing in `cargo test` can hang;
-   AC7 against a live model is exercised manually (see Test strategy).
+1. **Default branch name.** `--branch` is optional with no spec-stated
+   default. Since `run_id` (UUID v7) is already generated for the event log,
+   reused as `codemason/<run_id>` when `--branch` is omitted — unique per run,
+   sortable, namespaced so it can't collide with a human branch.
+2. **`.agent/` excluded from the git preflight clean-check and from the
+   postflight `git add`.** `.agent/` is this tool's own working area (already
+   excluded from `list_files` and the default `--log` path lives under it).
+   Without exclusion, a prior run's leftover `.agent/log/*.jsonl` would make
+   every subsequent run's preflight see a dirty tree and refuse to start —
+   an obvious operational trap the spec almost certainly doesn't intend.
+   Implemented via git pathspec exclusion (`-- . ':!.agent'`) on both the
+   status check and `git add -A`, so run logs are never part of a commit and
+   never block the next run.
+3. **Postflight commit runs after the loop for every outcome that reached the
+   loop** (`Completed`, `BudgetExceeded`, `MaxIterationsExceeded`, and
+   `ProviderError`), not only the two breach cases the Must list names by
+   name. Rationale: "partial work is often useful" is stated as a general
+   principle, and a provider error after several successful tool calls is
+   exactly a case where discarding on-disk changes would be needlessly
+   destructive. `--dry-run` skips all git mutation regardless of outcome —
+   no branch is created, nothing is staged or committed — so AC3's "leaves
+   the filesystem untouched" holds for `.git` state too, not only tracked
+   files.
+4. **`RunReport.status` string values** — not named in SPEC.md. Using:
+   `completed`, `budget_exceeded`, `max_iterations_exceeded`, `model_gated`,
+   `provider_error`, `unrecoverable_error`. One value per `ExitCode` variant
+   reachable from `run`.
+5. **Every exit path of `run_cmd` emits the JSON report**, per AC9's "every
+   exit path emits a matching `exit_code`" read together with "yields a file
+   parsing as one JSON object." `run_id` is generated first, before argument
+   validation, so even the earliest failure (bad `--task` file, missing
+   credential, config error, dirty worktree, model gated) can still populate
+   `run_id`, `status`, `exit_code`, `duration_ms`, and leave the rest
+   (`branch`, `commit`, `index`, `models_used`, `totals`) null/empty rather
+   than omitted. `models`/`index` subcommands are unaffected — AC9 only
+   concerns `run`.
+6. **Unix process-tree kill for `run_command`** is implemented (spawn via
+   `setsid sh -c '<command>'`, kill via shelled-out `kill -TERM -<pgid>` then
+   `-KILL`) so the container deploy target isn't left with a known-broken
+   path, but WP4's acceptance testing happens on Windows only per SPEC.md's
+   constraints table — the Unix path is unverified this package and flagged
+   as a risk, not claimed as tested.
 
 ## Approach
 
-### `Cargo.toml`
-
-```toml
-uuid = { version = "=1.25.0", features = ["v7"] }
-rand = "=0.9.5"
-```
-
-### `src/llm/types.rs`
-
-Wire types for the OpenAI-compatible chat completions shape actually used:
-`ChatMessage { role: String, content: Option<String>, tool_calls:
-Option<Vec<ToolCall>>, tool_call_id: Option<String>, name: Option<String> }`
-(the last two populate outgoing `tool` role messages), `ToolCall { id,
-r#type: "function", function: FunctionCall{name, arguments: String} }`,
-`ToolDef { r#type: "function", function: FunctionSpec{name, description,
-parameters: serde_json::Value} }`, `Usage { prompt_tokens, completion_tokens,
-total_tokens, cost: Option<f64> }` (all fields tolerant of absence —
-`#[serde(default)]` — since "absent or malformed usage" must not panic),
-request/response envelope structs.
-
-### `src/llm/mod.rs`
+### `src/error.rs` additions
 
 ```rust
-pub struct Client { base_url: String, api_key: String, http: ureq::Agent }
-pub struct CompletionResult { pub message: ChatMessage, pub usage: Option<Usage> }
-pub struct Totals { pub prompt: u64, pub completion: u64, pub total: u64, pub cost: f64 }
-
-impl Client {
-    pub fn new(base_url: String, api_key: String) -> Self;
-    pub fn complete(&self, model: &str, messages: &[ChatMessage], tools: &[ToolDef])
-        -> Result<CompletionResult, Error>;
-}
-
-pub struct UsageLedger { totals_by_model: HashMap<String, Totals> }
-impl UsageLedger {
-    pub fn record(&mut self, model: &str, usage: Option<&Usage>);
-    pub fn totals(&self) -> &HashMap<String, Totals>;
-}
+NotAGitWorktree { path: PathBuf },
+DirtyWorktree { path: PathBuf },
+GitCommand { args: String, source: anyhow::Error },   // non-zero exit from a git invocation we require to succeed
 ```
 
-`complete` builds the request body (`model`, `messages`, `tools`,
-`tool_choice: "auto"`, `usage: {"include": true}`), POSTs with `ureq`,
-retries `429`/`5xx` per the backoff formula above, and on the 5th exhausted
-attempt returns `Error::ProviderExhausted { model, attempts, last_status }` —
-a new `error.rs` variant the caller (the loop) maps straight to exit 5. A
-non-retryable status (other 4xx, transport error) returns a distinct
-`Error::ProviderRequest` variant on the first attempt, also mapped to exit 5
-by the caller — SPEC.md's Must list only names *retries* for 429/5xx,
-nothing about tolerating a hard 4xx.
+No git2/libgit2 types anywhere — every variant carries only strings/paths, per
+the existing rule (T1.2/T2/T3 carried forward).
 
-Parsing tolerates an absent/malformed `usage` object: `Option<Usage>::None`
-if missing or if the JSON shape doesn't parse, never a panic — the loop
-layer is what turns three consecutive `None`s into an abort.
-
-### `src/text.rs`
+### `src/repo.rs` (new)
 
 ```rust
-pub fn to_repo_relative(repo_root: &Path, raw: &str) -> Result<PathBuf, Error>; // canonicalize + traversal check
-pub fn normalize_slashes(path: &str) -> String;
+pub struct CommitInfo { pub sha: String, pub files_changed: Vec<String> }
 
-pub enum LineEnding { Lf, Crlf }
-pub struct ReadPresentation { pub content: String, pub line_ending: LineEnding, pub had_bom: bool }
-pub fn read_for_model(bytes: &[u8]) -> ReadPresentation;      // BOM strip, CRLF->LF, detect dominant ending
-pub fn restore_for_write(content_lf: &str, ending: LineEnding, had_bom: bool) -> Vec<u8>;
+pub fn preflight(repo_root: &Path, dry_run: bool) -> Result<(), Error>;
+// `git rev-parse --is-inside-work-tree` (not a worktree -> NotAGitWorktree);
+// `git status --porcelain -- . ':!.agent'` non-empty and !dry_run -> DirtyWorktree.
+// dry_run short-circuits both checks (Ok(()) unconditionally).
 
-pub fn looks_elided(existing: &str, new_content: &str) -> bool;
+pub fn create_branch(repo_root: &Path, name: &str) -> Result<(), Error>;
+// `git checkout -b <name>`; non-zero exit -> GitCommand.
 
-pub fn init_stdout_utf8();  // documents/enforces the write_all-only discipline; see inference 5
+pub fn commit_all(repo_root: &Path, message: &str) -> Result<Option<CommitInfo>, Error>;
+// `git add -A -- . ':!.agent'`;
+// `git diff --cached --name-only` -> files_changed (empty means nothing to commit -> Ok(None));
+// `git commit -m <message>` only if files_changed is non-empty;
+// `git rev-parse HEAD` -> sha.
 ```
 
-`to_repo_relative` canonicalizes `repo_root` once, joins the raw
-(forward-slash-normalized) path, canonicalizes the result, and rejects with
-an `Error::PathEscapesRepo` value (never a panic) if it doesn't start with
-the canonicalized root — every tool in `tools/fs.rs` and `tools/context.rs`
-routes paths through this before touching the filesystem.
+Every function shells to `git` via `std::process::Command::new("git").current_dir(repo_root)`,
+matching the Must's "shell out to the git CLI" and Must Not's "git2/libgit2
+must not be linked." A non-zero exit from a git invocation this module
+requires to succeed (checkout, commit, rev-parse) maps to `Error::GitCommand`
+with stderr captured — never a panic.
 
 ### `src/tools/mod.rs`
 
-```rust
-pub struct ToolDef { pub name: &'static str, pub description: &'static str, pub schema: serde_json::Value }
-pub fn registry() -> Vec<ToolDef>;               // the six, in the SPEC.md table's order
-pub fn as_llm_tool_defs() -> Vec<llm::ToolDef>;   // registry() reshaped for the wire format
+- Add `pub mod exec;`.
+- `ToolContext` gains `pub dry_run: bool`.
+- `dispatch`'s `"write_file"` arm calls `fs::write_file(ctx, &a.path, &a.content)`.
+- `dispatch`'s `"run_command"` arm calls
+  `exec::run_command(ctx, &a.command, a.timeout_seconds)`.
+- Drop the now-unnecessary `#[allow(dead_code)]` on `WriteFileArgs`/`RunCommandArgs`
+  fields, since both are read for real.
 
-pub enum ToolOutcome { Ok(String), Error(String) }  // Error still becomes a normal `tool` message
-pub fn dispatch(name: &str, args_json: &str, ctx: &ToolContext) -> DispatchResult;
-pub enum DispatchResult { Ran(ToolOutcome), UnknownTool, BadArguments(String) }
+### `src/tools/fs.rs` — `write_file`
+
+```rust
+pub fn write_file(ctx: &ToolContext, path: &str, content: &str) -> ToolOutcome
 ```
 
-Every schema: `{"type":"object","properties":{...only "type":"string" or
-"type":"integer" values...},"required":[...]}` — no nested `object`/`array`
-property ever appears, checked by AC6's test walking the `serde_json::Value`
-one level deep. `write_file`/`run_command` are present in `registry()` with
-real schemas (`path`+`content`; `command`+`timeout_seconds`) but `dispatch`
-returns `ToolOutcome::Error("write_file is not available until WP4")` /
-same for `run_command`, per the resolved ambiguity above.
+- `text::to_repo_relative`-equivalent resolution, but tolerant of a
+  not-yet-existing file: resolve the parent directory through
+  `to_repo_relative`, then join the final component (the existing helper
+  canonicalizes the full candidate, which fails for a file that doesn't exist
+  yet — `write_file` needs a variant that only requires the parent to exist
+  and be inside the root; added as `text::to_repo_relative_for_write`,
+  reusing `normalize_slashes` + a parent-only canonicalize-and-prefix-check,
+  same traversal-rejection logic as the read path).
+- `content.len() > 500 * 1024` → `ToolOutcome::Error` naming the limit, file
+  untouched.
+- `ctx.dry_run` → `ToolOutcome::Error("write_file: simulated under --dry-run, no write performed")`,
+  checked before touching the filesystem.
+- If the file exists: read its current bytes, run `text::read_for_model` to
+  get its current `(line_ending, had_bom)` and LF-normalized existing
+  content; run `text::looks_elided(existing, content)` — true →
+  `ToolOutcome::Error` instructing the model to supply the complete file,
+  file untouched. Restore convention via `text::restore_for_write(content, line_ending, had_bom)`.
+- If the file does not exist: create parent directories
+  (`std::fs::create_dir_all`), write `content` as plain UTF-8 bytes, no BOM
+  — there is no prior convention to preserve for a brand-new file.
+- Write via a temp-file-plus-rename in the same directory (`std::fs::write`
+  is adequate here — whole-file replacement, no partial-write concern beyond
+  what any tool run already carries) then return
+  `ToolOutcome::Ok("wrote N bytes to {path}")`.
 
-### `src/tools/context.rs`
+### `src/tools/exec.rs` (new) — `run_command`
 
-- `context_search(query, max_results)`: `index.search(query, top_k)` where
-  `top_k = if max_results == 0 { 10 } else { max_results as usize }` (0 = "use
-  a sensible default", consistent with `read_file`'s existing 0-means-unbounded
-  convention for line numbers, not literally zero results). Formats each
-  result as `path:start-end (score=..)` + a short preview (first ~3 content
-  lines) + related paths folded in from `graph.deps(file_path).depends_on`
-  and `graph.dependents(file_path)`, only when non-empty.
-- `context_outline(path)`: `to_repo_relative` then `graph.deps(&normalized)`;
-  `None` → `ToolOutcome::Error("no outline available for {path}")` (unsupported
-  language or file not in the index — not a panic); `Some(node)` → one line
-  per `Symbol{kind, name, line}`, plus `depends_on`.
+```rust
+pub fn run_command(ctx: &ToolContext, command: &str, timeout_seconds: i64) -> ToolOutcome
+```
 
-### `src/tools/fs.rs`
-
-- `read_file(path, start_line, end_line)`: `to_repo_relative`, read bytes,
-  refuse if a null byte appears in the first 8 KB (`ToolOutcome::Error`,
-  "binary file"), else `text::read_for_model`, slice `start_line..=end_line`
-  (`0` = open end per SPEC.md), cap the slice at 2000 lines with a truncation
-  note appended, number each line `"NNNN: ..."`.
-- `list_files(path, pattern, max_results)`: `to_repo_relative` for `path`
-  (root of the walk, `"."` default), `ignore::WalkBuilder` with
-  `default_ignored_dirs()` plus `.git`/`.agent` always excluded, an
-  `OverrideBuilder` glob from `pattern` when non-empty, capped at
-  `max_results` (0 → default 100).
-- Stub `write_file`/`run_command` handlers live in `tools/mod.rs`'s
-  `dispatch`, not here — there is no real filesystem-mutating or
-  process-spawning code to justify a WP3 `fs.rs` entry for them, and putting
-  the stub message next to the schema keeps the "not available until WP4"
-  behaviour in one obvious place.
+- `ctx.dry_run` → immediate `ToolOutcome::Error("run_command: simulated under --dry-run, not executed")`.
+- Timeout: `0` → default 120 s (existing 0-means-default convention); clamp
+  the requested value to `[1, 900]` s otherwise.
+- Spawn platform shell at `ctx.repo_root` with piped stdout+stderr:
+  - Windows: `cmd /C <command>`.
+  - Unix (`cfg(unix)`, best-effort — see inference 6): `setsid sh -c <command>`,
+    recording the child PID as the process-group ID `setsid` gives itself.
+- Two reader threads drain stdout/stderr into one `Arc<Mutex<Vec<u8>>>`
+  capped at 100 KB, dropping from the front (keeping the **last** 100 KB) and
+  setting a `truncated` flag once the cap is first exceeded — matches
+  "build errors appear at the end."
+- Main thread polls `child.try_wait()` in a short sleep loop against a
+  deadline; on timeout:
+  - Windows: shell out `taskkill /PID <pid> /T /F`.
+  - Unix: shell out `kill -TERM -<pgid>`, brief grace period, then
+    `kill -KILL -<pgid>` if still alive.
+  - Reap the child, return `ToolOutcome::Error` naming the timeout with
+    whatever output was captured appended — a killed command has no real
+    exit code to report.
+- On normal exit: format `ToolOutcome::Ok` (even for non-zero exit — "a
+  non-zero exit is a normal result, not a tool failure") containing the exit
+  code, a truncation notice if the cap fired, and the captured output.
 
 ### `src/loop.rs`
 
+- `LoopConfig` gains `budget_tokens: u64`, `budget_usd: Option<f64>`,
+  `dry_run: bool`; `max_iterations` loses `#[allow(dead_code)]` — it's read
+  now.
+- `LoopExit` gains `BudgetExceeded { iterations: u32 }` and
+  `MaxIterationsExceeded { iterations: u32 }`.
+- Before the loop's first iteration and before every subsequent
+  `client.complete` call: `budget_breached(cfg, &ledger)` —
+  `cfg.budget_tokens == 0 || cfg.budget_usd.is_some_and(|b| b <= 0.0)` (start
+  refusal, strict-zero per the resolved ambiguity) **or**
+  `ledger.total_tokens() >= cfg.budget_tokens` **or**
+  `cfg.budget_usd.is_some_and(|b| ledger.total_cost() >= b)` (breach from
+  accumulated usage). On breach: log `budget_exceeded`, return
+  `LoopExit::BudgetExceeded { iterations }` without making the call.
+- Same site, iteration ceiling: `iterations >= cfg.max_iterations` (checked
+  before incrementing for the call about to be made) → log
+  `max_iterations_exceeded`, return `LoopExit::MaxIterationsExceeded { iterations }`.
+- `ToolContext` construction at the per-call-site gains `dry_run: cfg.dry_run`.
+- `UsageLedger` (in `src/llm/mod.rs`) gains `total_tokens(&self) -> u64` and
+  `total_cost(&self) -> f64`, summing `Totals` across every model — needed by
+  the two breach checks above and by the final report's `totals` field.
+
+### `src/bin/codemason.rs` — `run_cmd` restructure
+
+1. `let run_id = Uuid::now_v7();` and `let start = std::time::Instant::now();`
+   first, before argument parsing — every subsequent return path can report
+   `run_id` and `duration_ms`.
+2. A local, mutable `RunReport` (new `src/report.rs`, `Serialize`) is threaded
+   through the function and updated as more becomes known; a small
+   `finish(report: RunReport, code: ExitCode) -> ExitCode` helper sets
+   `status`/`exit_code`/`duration_ms`, serializes with `serde_json::to_string`
+   (single line — "exactly one JSON object on stdout, nothing else"), writes
+   it via `text::write_stdout`, and returns `code`. Every existing
+   `eprintln!("error: ..."); return ExitCode::X;` pair becomes
+   `eprintln!("error: ..."); return finish(report, ExitCode::X);` — diagnostics
+   stay on stderr, unchanged; only the previously-bare returns gain the
+   stdout report.
+3. New step, immediately after argument parsing and before config
+   resolution: `repo::preflight(&args.repo, args.dry_run)` — failure exits 1
+   via `finish`, before any network call, satisfying AC7.
+4. Existing config/credential/gating/index sequence is unchanged in order,
+   each updating `report` fields as they succeed (`report.index = Some(...)`
+   after `Index::build`, etc.).
+5. After the index builds and before constructing the loop: if `!args.dry_run`,
+   `let branch = args.branch.clone().unwrap_or_else(|| format!("codemason/{run_id}"));`
+   then `repo::create_branch(&args.repo, &branch)?`; `report.branch = Some(branch)`.
+   Under `--dry-run`, `report.branch` stays `None` and no branch is created.
+6. `LoopConfig` gains the three new fields from `args`.
+7. After `run_loop` returns, **unconditionally** (unless `--dry-run`):
+   `repo::commit_all(&args.repo, &commit_message)?` — a fixed, non-templated
+   message such as `"codemason: {task}"` truncated to a reasonable length is
+   sufficient; not spec'd, low-risk. Populate `report.commit`,
+   `report.files_changed` from the `Option<CommitInfo>` (both stay
+   empty/`None` when nothing changed).
+8. `report.iterations`, `report.models_used = vec![model_id]`,
+   `report.totals` from `ledger.total_tokens()/total_cost()`, `report.log_path`
+   are set from values already in scope. Exit code follows `LoopExit`:
+   `Completed`→0, `BudgetExceeded`→2, `MaxIterationsExceeded`→3,
+   `ProviderError`→5.
+
+### `src/text.rs` addition
+
 ```rust
-pub struct LoopConfig {
-    pub repo_root: PathBuf,
-    pub task: String,
-    pub model: String,
-    pub max_iterations: u32,   // threaded through, unenforced this package — inference 8
-}
-pub enum LoopExit {
-    Completed { summary: String, iterations: u32 },
-    ProviderError { reason: String, iterations: u32 },
-}
-pub fn run(
-    cfg: &LoopConfig,
-    client: &llm::Client,
-    index: &Index,
-    log: &mut log::EventLog,
-) -> (LoopExit, llm::UsageLedger);
+pub fn to_repo_relative_for_write(repo_root: &Path, raw: &str) -> Result<PathBuf, Error>;
 ```
 
-History seeded with the system message (repo path + the three-tool discovery
-order + "reply with a summary and no tool calls when done", verbatim per
-T3.4) and a user message holding `task`. Each turn: log `llm_call`, call
-`client.complete`; on `Err` → log `run_failed`, return `ProviderError`
-(caller maps to exit 5). On success: append the full assistant message
-as-is (content *and* `tool_calls` together, per SPEC.md, not split apart).
-No `tool_calls` → `Completed`. Otherwise, for each call in order: parse
-`arguments` as JSON — failure appends a `tool` message describing exactly
-what was wrong, increments a per-tool-name consecutive-failure counter, and
-if that counter hits 3, returns `ProviderError`; success resets that
-counter. Unknown tool name → `tool` message listing the six valid names, no
-abort (SPEC.md only names three-consecutive-same-tool-parse-failures and
-three-consecutive-missing-usage as abort conditions — an unknown name isn't
-one of them). Missing/malformed usage on a response increments a separate
-whole-run counter; 3 consecutive → `ProviderError`; any response with valid
-usage resets it to 0.
-
-### `src/log.rs`
-
-```rust
-pub struct EventLog { writer: BufWriter<File>, run_id: Uuid, seq: u64 }
-impl EventLog {
-    pub fn open(path: &Path, run_id: Uuid) -> Result<Self, Error>;
-    pub fn write(&mut self, event_type: &str, fields: serde_json::Value); // envelope + flush, one line
-}
-```
-
-One `write_all` of the fully-formed line (`{ts, run_id, seq, type, ...fields}`
-serialized once) plus a line count under Windows terminates lines with a
-single `flush()` right after — nothing is buffered across calls, satisfying
-"flushed after every write" and keeping a mid-kill log's earlier lines
-independently parseable. `seq` starts at 1 and increments per call,
-contiguous by construction (single writer, no concurrent writers within one
-process). Event field payloads follow SPEC.md's "sizes and truncation
-flags, never file contents or full tool results" — e.g. `tool_result` logs
-`{tool, ok, result_chars, truncated}`, never the string itself;
-`run_started` logs `{repo, model, task_chars}`, never the task text.
-`budget_exceeded`/`max_iterations_exceeded`/`model_gated`/`model_unlisted`
-variant *names* exist in this file's event-type set now (SPEC.md lists all
-of them under T3.5 as WP3's job to define), but nothing in WP3 emits the
-budget/iteration ones — WP4 wires those call sites when the enforcement
-they describe actually exists.
-
-### `src/bin/codemason.rs`
-
-`run_cmd`, after `gating::check` passes: resolve `--log` (or the
-`.agent/log/run-<uuid>.jsonl` default), open the `EventLog`, log
-`run_started`; `Index::build(&args.repo)` (mapping build failure to
-`ExitCode::UnrecoverableError` same as `index_cmd` already does), log
-`index_built`; construct `llm::Client`; call `loop_::run`; on `Completed`,
-print the summary to stdout, log `run_completed`, exit 0; on
-`ProviderError`, log already written by `loop_::run`, exit 5.
-
-### `src/error.rs` additions
-
-`ProviderExhausted { model, attempts, last_status }`,
-`ProviderRequest { model, source }`, `PathEscapesRepo { path }`,
-`LogOpen { path, source }` — no reference to any external crate's own error
-or exit-code type, carried forward from T1.2/T2's rule.
+Same traversal-rejection contract as `to_repo_relative`, but canonicalizes
+only the parent directory (which must exist and resolve inside the root) and
+joins the final path component uncanonicalized — the target file itself is
+allowed not to exist yet. `read_file`/`list_files`/`context_*` keep using the
+existing `to_repo_relative`, unchanged.
 
 ## Test strategy, by acceptance criterion
 
-- **AC1** `tests/llm_client.rs`: extended stub answers one `POST
-  /chat/completions` with a canned assistant message + usage block;
-  `Client::complete` called directly (library-level, no CLI spawn); assert
-  the parsed message and `usage.total_tokens > 0`.
-- **AC2** Same file: (a) stub sequence `[429, 429, 200]` on
-  `/chat/completions` → `complete` succeeds, asserted attempt count == 3; (b)
-  `[500, 500, 500, 500, 500]` → `Err(ProviderExhausted)`; (c) a `200`
-  response with the `usage` key stripped from the JSON body → `complete`
-  still returns `Ok` with `usage: None`, no panic.
-- **AC3** `src/text.rs` unit tests, `#[cfg(test)] mod tests`, same convention
-  as `config.rs`/`gating.rs`: traversal (`../../etc`) rejected as `Err`, not
-  panic; a CRLF fixture round-trips CRLF; a BOM fixture round-trips with BOM;
-  an LF fixture's write path never introduces `\r\n`; `looks_elided` true at
-  40% length with each of the three markers present, false without any
-  marker; a synthetic path exceeding 260 chars (nested temp dirs) reads
-  successfully through `to_repo_relative`.
-- **AC4/AC5** `src/tools/context.rs` unit tests against the real C# fixture
-  under `old_source/` (same skip-if-absent pattern as `index.rs`'s AC4/AC5
-  tests) — `context_search` for a known symbol returns it as the first
-  result; `context_outline` on a known file lists its expected member
-  symbols.
-- **AC6** `src/tools/mod.rs` unit test: for each of the six `ToolDef`s, walk
-  `schema["properties"]` one level and assert every value's `"type"` is
-  `"string"` or `"integer"`, and that no property value itself contains a
-  nested `"properties"` or `"items"` key.
-- **AC7** Two parts, per the resolved-ambiguity precedent WP2 set for AC4:
-  (a) `tests/loop_.rs`, automated — a fabricated multi-turn stub trace
-  (assistant calls `context_search`, then `read_file`, then answers with no
-  tool calls) drives `loop_::run` directly and asserts the call order and
-  that it terminates `Completed`; this proves the loop's *mechanics*, not a
-  live model's judgment. (b) A real `codemason run --repo . --task "Describe
-  the structure of this repository"` against a live provider, run by hand
-  once credentials are available, reported directly in the AC table — same
-  treatment as WP2's AC4.
-- **AC8** `tests/loop_.rs`: a stub trace with one malformed-JSON tool-call
-  response and one unknown-tool-name response, each followed by a normal
-  terminating response — assert the run completes normally (no panic, no
-  premature abort, since two isolated bad calls don't reach the
-  three-consecutive threshold).
-- **AC9** `tests/event_log.rs`: (a) a full completed run's log file, parsed
-  line by line, has contiguous `seq` and contains at least one each of
-  `run_started`, `index_built`, `llm_call`, `run_completed`; (b) spawn
-  `codemason run` against a stub that stalls for several iterations, kill
-  the child mid-run (`Child::kill()`), then parse the log — every line
-  except possibly a truncated final one must parse as valid JSON.
+- **AC1** `src/tools/fs.rs` unit tests: write to a CRLF fixture with new LF
+  content → file bytes still CRLF-terminated (`fs::read` verifies), `git diff`
+  of a real fixture repo shows a minimal diff (line-content only, no
+  line-ending churn); a BOM fixture retains its BOM after a write.
+- **AC2** `src/tools/fs.rs` unit tests: elided content (existing large,
+  new content under 50% length with a marker) → `ToolOutcome::Error`, file
+  bytes unchanged on disk; a >500 KB content string → `ToolOutcome::Error`,
+  no file created.
+- **AC3** `tests/` integration test: `codemason run --dry-run` against a
+  fixture repo with a task that would trigger a write; assert the working
+  tree and `.git` refs are byte-identical before/after (no branch created,
+  no commit), and the process still exits reflecting `LoopExit::Completed`
+  (0) via a stub trace that terminates normally.
+- **AC4** `src/tools/exec.rs` unit tests: a command producing >100 KB of
+  output → result contains a truncation notice and exactly the last 100 KB;
+  a command that `exit 1`s → `ToolOutcome::Ok` containing `exit_code: 1` (not
+  `Error`).
+- **AC5** `src/tools/exec.rs` test (Windows-only, matching the constraints
+  table's primary verify platform): spawn a command that itself spawns a
+  detached child holding a file lock (e.g. `cmd /C "start /B ... & timeout ..."`
+  or a small helper batch script) with a timeout shorter than the child's
+  lifetime; assert the file lock is released (the file is deletable) once
+  `run_command` returns, proving the tree — not just the immediate shell —
+  was killed.
+- **AC6** `tests/`: a fixture repo with one commit succeeds end to end
+  against a stub trace that calls `write_file` once — assert exactly one new
+  commit exists (`git log --oneline` count) containing the expected file; a
+  second run with a stub trace that makes no tool calls produces no new
+  commit.
+- **AC7** `src/repo.rs` unit test: `preflight` against a repo with an
+  uncommitted change and `dry_run: false` → `Err(DirtyWorktree)`; integration
+  test: `codemason run` (no `--dry-run`) against a dirty fixture exits 1 and
+  the stub server (if any) recorded zero requests.
+- **AC8** `tests/loop_.rs` / integration: `--budget-tokens 0` → `run_loop`
+  returns `BudgetExceeded` at 0 iterations, ledger empty, zero stub requests
+  (per the resolved ambiguity, tested at `0` not `1` — see above); a stub
+  trace whose first response reports usage already exceeding a small
+  `--budget-tokens` value → exactly one call made, `BudgetExceeded` returned,
+  and (via the full `codemason run` integration path) a commit exists holding
+  whatever the one completed tool call changed; `--max-iterations 2` against
+  a stub trace with 3+ available turns → `MaxIterationsExceeded` after
+  exactly 2 calls, partial commit present.
+- **AC9** integration test: `codemason run ... > out.json 2> err.log` against
+  a normal-completion stub — `out.json` parses as exactly one JSON object,
+  `err.log` contains the human-readable summary/diagnostics; the same
+  assertion repeated with `--verbose` shows stdout unchanged; one test per
+  distinct exit path (dirty worktree→1, budget-tokens 0→2, max-iterations→3,
+  model-gated→4, provider exhausted→5) each asserts stdout parses as one
+  object whose `exit_code` field matches the process's actual exit code.
 
 ## Risk flags
 
-1. **Endpoint path and `usage.include` flag are inferences** (same category
-   as WP2's `/models` path) — flagged for sign-off.
-2. **Retry/backoff exact formula** (base 1s, ×2 each attempt, 60s cap, 5
-   attempts, 0–250ms jitter) is my own construction of "exponential backoff
-   and jitter" — SPEC.md gives the four numeric bounds but not the formula
-   shape.
-3. **Elision marker strings** are read literally from SPEC.md's own
-   backticked examples; a marker set that differs from what a real model
-   actually writes (e.g. "rest remains the same") would still slip through
-   undetected until WP4 exercises this against real model output.
-4. **`--log` default path under `.agent/`** is inferred, not spec'd.
-5. **AC7 is only partially automated** — the live-model half needs
-   credentials this sandbox doesn't have; flagged the same way WP2 flagged
-   its AC4.
-6. **`max_iterations` unenforced this package** (inference 8 above) — if
-   this reading is wrong and WP3 was expected to cap iterations itself, that
-   changes `loop.rs`'s public shape before WP4 extends it.
-7. **`StubServer` extension changes shared test infrastructure**
-   (`tests/common/mod.rs`) that `tests/gating.rs` already depends on — the
-   plan is additive (new methods, `StubServer::start` untouched) specifically
-   to avoid destabilizing WP2's passing tests, but it's still a shared-file
-   edit worth flagging.
+1. **Budget refusal semantics deviate from AC8's literal "1"** — resolved
+   with the developer this session (see Ambiguity section); documenting again
+   here because it changes what the AC8 test actually exercises versus what
+   the spec's table literally says.
+2. **Unix process-tree kill (`setsid`/`kill -TERM -pgid`) is unverified** —
+   Windows 10 is this project's only verify platform; the Unix path is
+   written for the container deploy target but AC5 is only exercised on
+   Windows this package.
+3. **`.agent/` excluded from git status/add via pathspec** is an inference
+   (see Other inferences #2) — if a real target repo already tracks a
+   `.agent/` path for its own unrelated reasons, this exclusion would hide
+   it from both the dirty-check and the commit, which could surprise an
+   operator. Narrow and unlikely, flagged for visibility.
+4. **Default branch name `codemason/<run_id>`** and the **commit message
+   format** are both inferences with no basis in SPEC.md beyond "create and
+   checkout the branch" / "commit... if something changed" — reasonable but
+   not spec'd, flagged for sign-off same as WP2/WP3 flagged their own
+   naming inferences.
+5. **Postflight commit on `ProviderError`, not only budget/iteration breach**
+   — Must list names only budget/iteration breach explicitly; extending the
+   same "commit partial work" treatment to a provider error after partial
+   tool-call progress is my reading of the stated principle, not a literal
+   requirement. If wrong, `repo.rs`'s `commit_all` call site in
+   `bin/codemason.rs` is the one place to gate it differently.
+6. **`write_file`'s new `to_repo_relative_for_write` duplicates most of
+   `to_repo_relative`** rather than generalizing the existing function with a
+   `must_exist: bool` parameter — chosen to avoid touching `text.rs`'s
+   already-tested read-path function and its five passing WP3 unit tests;
+   flagged in case a single parameterized function is preferred instead.

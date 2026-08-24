@@ -267,3 +267,52 @@ pub fn codemason(cwd: &std::path::Path) -> Command {
     cmd.current_dir(cwd);
     cmd
 }
+
+/// Initialize `dir` as a clean git repository with one commit of whatever is
+/// already on disk. WP4's preflight check refuses to run against anything
+/// that isn't a clean git worktree, so every integration test that spawns
+/// `codemason run` against a fixture directory needs this first — write the
+/// fixture files, then call this, then spawn.
+#[allow(dead_code)]
+pub fn init_git_repo(dir: &std::path::Path) {
+    let run = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "codemason-test@example.com"]);
+    run(&["config", "user.name", "codemason-test"]);
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "initial"]);
+}
+
+/// Parses `stdout` as exactly one JSON object (WP4 AC9: "yields a file
+/// parsing as one JSON object") and asserts its `exit_code` field matches
+/// the process's actual exit code.
+#[allow(dead_code)]
+pub fn assert_single_json_report(stdout: &[u8], expected_exit_code: i32) -> serde_json::Value {
+    let text = String::from_utf8_lossy(stdout);
+    let trimmed = text.trim();
+    assert!(!trimmed.is_empty(), "stdout must not be empty");
+
+    let mut de = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    let first = de
+        .next()
+        .unwrap_or_else(|| panic!("stdout did not contain a JSON value: {trimmed:?}"))
+        .unwrap_or_else(|e| panic!("stdout did not parse as JSON: {e}\nstdout: {trimmed:?}"));
+    assert!(
+        de.next().is_none(),
+        "stdout contained more than one JSON value: {trimmed:?}"
+    );
+
+    assert_eq!(
+        first["exit_code"],
+        serde_json::json!(expected_exit_code),
+        "report exit_code did not match the process exit code; report: {first}"
+    );
+    first
+}

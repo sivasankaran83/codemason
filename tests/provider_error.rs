@@ -32,6 +32,7 @@ fn five_consecutive_500s_exit_the_process_with_code_5() {
     fs::write(cwd.join("a.rs"), "fn main() {}\n").unwrap();
     let model_id = "vendor/flaky-model";
     write_models_toml(&cwd, model_id);
+    common::init_git_repo(&cwd);
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -64,7 +65,7 @@ fn five_consecutive_500s_exit_the_process_with_code_5() {
             "--api-key",
             "test-key",
         ])
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache"))
+        .env("CODEMASON_CACHE_DIR", temp_dir("provider-error-500x5-cache"))
         .output()
         .expect("run codemason run");
 
@@ -74,6 +75,7 @@ fn five_consecutive_500s_exit_the_process_with_code_5() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    common::assert_single_json_report(&output.stdout, 5);
 
     let completions_requests = stub
         .requests()

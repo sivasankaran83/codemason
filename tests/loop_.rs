@@ -78,6 +78,9 @@ fn ac7_loop_calls_context_search_before_read_file_and_terminates() {
         task: "Describe the structure of this repository".to_string(),
         model: "vendor/model".to_string(),
         max_iterations: 40,
+        budget_tokens: 200_000,
+        budget_usd: None,
+        dry_run: false,
     };
 
     let (exit, _ledger) = run_loop(&cfg, &client, &index, &mut log);
@@ -86,9 +89,7 @@ fn ac7_loop_calls_context_search_before_read_file_and_terminates() {
             assert_eq!(iterations, 3);
             assert!(summary.contains("Rust file"));
         }
-        LoopExit::ProviderError { reason, .. } => {
-            panic!("expected completion, got provider error: {reason}")
-        }
+        other => panic!("expected completion, got {other:?}"),
     }
 
     let requests = stub.requests();
@@ -153,6 +154,9 @@ fn ac8_malformed_and_unknown_tool_calls_continue_without_panicking() {
         task: "hello".to_string(),
         model: "vendor/model".to_string(),
         max_iterations: 40,
+        budget_tokens: 200_000,
+        budget_usd: None,
+        dry_run: false,
     };
 
     let (exit, _ledger) = run_loop(&cfg, &client, &index, &mut log);
@@ -161,8 +165,6 @@ fn ac8_malformed_and_unknown_tool_calls_continue_without_panicking() {
             assert_eq!(iterations, 3);
             assert!(summary.contains("Recovered"));
         }
-        LoopExit::ProviderError { reason, .. } => {
-            panic!("expected completion, got provider error: {reason}")
-        }
+        other => panic!("expected completion, got {other:?}"),
     }
 }

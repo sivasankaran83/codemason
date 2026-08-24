@@ -36,8 +36,11 @@ finishing. Good retrieval is what makes cheap execution viable.
 
 ## Status
 
-Milestone 1, not started. See `SPEC.md` for scope, work packages and acceptance
-criteria, and `CLAUDE.md` for how work proceeds in this repository.
+Milestone 1, work packages 1 through 4 complete (engine harvest, CLI/config/
+gating, the read-only agent loop, and writes/commands/git/budget). WP5
+(measurement, containerisation, acceptance suite) remains. See `SPEC.md` for
+scope, work packages and acceptance criteria, and `CLAUDE.md` for how work
+proceeds in this repository.
 
 ## Exit codes
 

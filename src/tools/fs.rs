@@ -1,7 +1,5 @@
-//! `read_file` and `list_files`. `write_file` and `run_command` are
-//! registered in `tools::mod`'s schema list but stubbed there — WP4 gives
-//! them real implementations (in this file and a new `exec.rs`
-//! respectively) without changing the schemas.
+//! `read_file`, `list_files` and `write_file`. `run_command` lives in the
+//! sibling `exec.rs`.
 
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
@@ -12,6 +10,7 @@ use crate::tools::{ToolContext, ToolOutcome};
 const DEFAULT_MAX_RESULTS: usize = 100;
 const READ_LINE_CAP: usize = 2000;
 const BINARY_PROBE_BYTES: usize = 8192;
+const WRITE_MAX_BYTES: usize = 500 * 1024;
 
 pub fn read_file(ctx: &ToolContext, path: &str, start_line: i64, end_line: i64) -> ToolOutcome {
     let resolved = match text::to_repo_relative(ctx.repo_root, path) {
@@ -68,6 +67,51 @@ pub fn read_file(ctx: &ToolContext, path: &str, start_line: i64, end_line: i64) 
     }
 
     ToolOutcome::Ok(out)
+}
+
+/// Whole-file replacement. Creates parent directories and the file itself if
+/// absent. Rejects (as a tool-result error the model can act on, never a
+/// panic or a failed run): content over 500 KB, a path outside the repo
+/// root, content that looks elided, and any attempt under `--dry-run` — each
+/// check runs before anything touches the filesystem.
+pub fn write_file(ctx: &ToolContext, path: &str, content: &str) -> ToolOutcome {
+    if ctx.dry_run {
+        return ToolOutcome::Error(format!(
+            "write_file: --dry-run is set, the write to {path} was simulated and not performed"
+        ));
+    }
+
+    if content.len() > WRITE_MAX_BYTES {
+        return ToolOutcome::Error(format!(
+            "content for {path} is {} bytes, over the {WRITE_MAX_BYTES}-byte limit; write it in smaller pieces or reduce it",
+            content.len()
+        ));
+    }
+
+    let resolved = match text::to_repo_relative_for_write(ctx.repo_root, path) {
+        Ok(p) => p,
+        Err(err) => return ToolOutcome::Error(err.to_string()),
+    };
+
+    let (line_ending, had_bom) = match std::fs::read(&resolved) {
+        Ok(existing_bytes) => {
+            let presentation = text::read_for_model(&existing_bytes);
+            if text::looks_elided(&presentation.content, content) {
+                return ToolOutcome::Error(format!(
+                    "content for {path} looks like it elided unchanged code (short and containing a marker like \"... rest of\" or \"unchanged\"); supply the complete file content"
+                ));
+            }
+            (presentation.line_ending, presentation.had_bom)
+        }
+        Err(_) => (text::LineEnding::Lf, false),
+    };
+
+    let bytes = text::restore_for_write(content, line_ending, had_bom);
+    if let Err(err) = std::fs::write(&resolved, &bytes) {
+        return ToolOutcome::Error(format!("failed to write {path}: {err}"));
+    }
+
+    ToolOutcome::Ok(format!("wrote {} bytes to {path}", bytes.len()))
 }
 
 pub fn list_files(ctx: &ToolContext, path: &str, pattern: &str, max_results: i64) -> ToolOutcome {
@@ -181,6 +225,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &dir,
             index: &index,
+            dry_run: false,
         };
 
         let outcome = read_file(&ctx, "a.rs", 2, 3);
@@ -202,6 +247,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &dir,
             index: &index,
+            dry_run: false,
         };
 
         let outcome = read_file(&ctx, "bin.dat", 0, 0);
@@ -221,6 +267,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &dir,
             index: &index,
+            dry_run: false,
         };
 
         let outcome = list_files(&ctx, ".", "", 0);
@@ -244,6 +291,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &dir,
             index: &index,
+            dry_run: false,
         };
 
         let outcome = list_files(&ctx, ".", "*.rs", 0);
@@ -254,5 +302,96 @@ mod tests {
             }
             ToolOutcome::Error(err) => panic!("unexpected error: {err}"),
         }
+    }
+
+    #[test]
+    fn write_file_creates_a_new_file_with_parent_dirs() {
+        let dir = temp_repo("write-new");
+        std::fs::write(dir.join("seed.rs"), "fn main() {}\n").unwrap();
+        let index = Index::build(&dir).expect("index build should succeed");
+        let ctx = ToolContext {
+            repo_root: &dir,
+            index: &index,
+            dry_run: false,
+        };
+
+        let outcome = write_file(&ctx, "nested/dir/new.txt", "hello\nworld\n");
+        assert!(matches!(outcome, ToolOutcome::Ok(_)), "{outcome:?}");
+        let content = std::fs::read_to_string(dir.join("nested/dir/new.txt")).unwrap();
+        assert_eq!(content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn write_file_preserves_crlf_and_bom() {
+        let dir = temp_repo("write-crlf-bom");
+        let mut original = vec![0xEFu8, 0xBB, 0xBF];
+        original.extend_from_slice(b"one\r\ntwo\r\n");
+        std::fs::write(dir.join("a.txt"), &original).unwrap();
+        std::fs::write(dir.join("seed.rs"), "fn main() {}\n").unwrap();
+        let index = Index::build(&dir).expect("index build should succeed");
+        let ctx = ToolContext {
+            repo_root: &dir,
+            index: &index,
+            dry_run: false,
+        };
+
+        let outcome = write_file(&ctx, "a.txt", "one\ntwo\nthree\n");
+        assert!(matches!(outcome, ToolOutcome::Ok(_)), "{outcome:?}");
+        let written = std::fs::read(dir.join("a.txt")).unwrap();
+        assert!(written.starts_with(&[0xEF, 0xBB, 0xBF]));
+        let text = String::from_utf8_lossy(&written[3..]);
+        assert_eq!(text, "one\r\ntwo\r\nthree\r\n");
+    }
+
+    #[test]
+    fn write_file_rejects_elided_content_and_leaves_file_unmodified() {
+        let dir = temp_repo("write-elision");
+        let existing = "a".repeat(1000);
+        std::fs::write(dir.join("big.rs"), &existing).unwrap();
+        let index = Index::build(&dir).expect("index build should succeed");
+        let ctx = ToolContext {
+            repo_root: &dir,
+            index: &index,
+            dry_run: false,
+        };
+
+        let elided = format!("{}\n// ... rest of the file unchanged", "a".repeat(390));
+        let outcome = write_file(&ctx, "big.rs", &elided);
+        assert!(matches!(outcome, ToolOutcome::Error(_)));
+        let unchanged = std::fs::read_to_string(dir.join("big.rs")).unwrap();
+        assert_eq!(unchanged, existing);
+    }
+
+    #[test]
+    fn write_file_rejects_content_over_500kb() {
+        let dir = temp_repo("write-too-big");
+        std::fs::write(dir.join("seed.rs"), "fn main() {}\n").unwrap();
+        let index = Index::build(&dir).expect("index build should succeed");
+        let ctx = ToolContext {
+            repo_root: &dir,
+            index: &index,
+            dry_run: false,
+        };
+
+        let huge = "a".repeat(500 * 1024 + 1);
+        let outcome = write_file(&ctx, "huge.txt", &huge);
+        assert!(matches!(outcome, ToolOutcome::Error(_)));
+        assert!(!dir.join("huge.txt").exists());
+    }
+
+    #[test]
+    fn write_file_under_dry_run_touches_nothing() {
+        let dir = temp_repo("write-dry-run");
+        std::fs::write(dir.join("seed.rs"), "fn main() {}\n").unwrap();
+        let index = Index::build(&dir).expect("index build should succeed");
+        let ctx = ToolContext {
+            repo_root: &dir,
+            index: &index,
+            dry_run: true,
+        };
+
+        let outcome = write_file(&ctx, "new.txt", "hello\n");
+        assert!(matches!(outcome, ToolOutcome::Error(_)));
+        assert!(!dir.join("new.txt").exists());
     }
 }

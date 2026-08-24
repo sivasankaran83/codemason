@@ -127,6 +127,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &repo,
             index: &index,
+            dry_run: false,
         };
         let outcome = context_search(&ctx, "AgentSchedulerService", 5);
         match outcome {
@@ -153,6 +154,7 @@ mod tests {
         let ctx = ToolContext {
             repo_root: &repo,
             index: &index,
+            dry_run: false,
         };
 
         // Find a C# file the graph actually indexed, then ask for its

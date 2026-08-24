@@ -66,4 +66,17 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("{path} is not a git working tree")]
+    NotAGitWorktree { path: std::path::PathBuf },
+
+    #[error("{path} has uncommitted changes; commit, stash, or pass --dry-run")]
+    DirtyWorktree { path: std::path::PathBuf },
+
+    #[error("git {args} failed: {source}")]
+    GitCommand {
+        args: String,
+        #[source]
+        source: anyhow::Error,
+    },
 }

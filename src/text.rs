@@ -49,6 +49,69 @@ pub fn to_repo_relative(repo_root: &Path, raw: &str) -> Result<PathBuf, Error> {
     Ok(canonical)
 }
 
+/// Same traversal-rejection contract as `to_repo_relative`, but tolerant of a
+/// target file that does not exist yet: only the parent directory is
+/// required to exist (it is created if absent) and resolve inside the
+/// repository root. `write_file` is the only caller — every read-path tool
+/// keeps using `to_repo_relative`, which correctly requires the full path to
+/// already exist.
+///
+/// Traversal is rejected lexically, *before* any directory is created:
+/// `canonicalize` cannot be used for this check up front because it requires
+/// the path to already exist, so a `..` component is walked against a stack
+/// seeded with the (already-canonical) root's own components, refusing to
+/// pop below that seed. Only once the candidate is proven to lexically stay
+/// inside the root does `create_dir_all` run, and the result is canonicalized
+/// again afterward as defense in depth against a symlink planted inside the
+/// repository.
+pub fn to_repo_relative_for_write(repo_root: &Path, raw: &str) -> Result<PathBuf, Error> {
+    let escapes = || Error::PathEscapesRepo {
+        path: raw.to_string(),
+    };
+
+    let root_canonical = repo_root.canonicalize().map_err(|_| escapes())?;
+
+    let normalized = normalize_slashes(raw);
+    let trimmed = normalized.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err(escapes());
+    }
+
+    let root_len = root_canonical.components().count();
+    let mut stack: Vec<std::path::Component> = root_canonical.components().collect();
+    for component in Path::new(trimmed).components() {
+        match component {
+            std::path::Component::Normal(seg) => stack.push(std::path::Component::Normal(seg)),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if stack.len() <= root_len {
+                    return Err(escapes());
+                }
+                stack.pop();
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(escapes());
+            }
+        }
+    }
+    if stack.len() <= root_len {
+        return Err(escapes());
+    }
+
+    let candidate: PathBuf = stack.iter().collect();
+    let file_name = candidate.file_name().ok_or_else(escapes)?.to_os_string();
+    let parent = candidate.parent().ok_or_else(escapes)?;
+
+    std::fs::create_dir_all(parent).map_err(|_| escapes())?;
+
+    let parent_canonical = parent.canonicalize().map_err(|_| escapes())?;
+    if !parent_canonical.starts_with(&root_canonical) {
+        return Err(escapes());
+    }
+
+    Ok(parent_canonical.join(file_name))
+}
+
 /// The repo-root-relative string a canonical path resolves to, in whatever
 /// separator convention `std::path::Path::to_string_lossy` produces on this
 /// platform. This intentionally matches the engine's own chunk/graph keys
@@ -289,5 +352,27 @@ mod tests {
         let resolved = to_repo_relative(&root, &rel).expect("long path should resolve");
         let content = fs::read_to_string(&resolved).expect("long path should be readable");
         assert_eq!(content, "deep content");
+    }
+
+    #[test]
+    fn for_write_rejects_traversal_before_creating_anything() {
+        let root_parent = temp_dir("write-traversal-parent");
+        let root = root_parent.join("repo");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = to_repo_relative_for_write(&root, "../escape.txt")
+            .expect_err("should reject traversal");
+        assert!(matches!(err, Error::PathEscapesRepo { .. }));
+        assert!(!root_parent.join("escape.txt").exists());
+    }
+
+    #[test]
+    fn for_write_resolves_a_new_file_and_creates_parent_dirs() {
+        let root = temp_dir("write-new-file");
+        let resolved = to_repo_relative_for_write(&root, "nested/dir/new.txt")
+            .expect("should resolve a not-yet-existing file");
+        assert!(resolved.parent().unwrap().is_dir());
+        assert!(!resolved.exists());
+        assert_eq!(resolved.file_name().unwrap(), "new.txt");
     }
 }

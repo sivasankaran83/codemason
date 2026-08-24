@@ -23,16 +23,35 @@ pub struct LoopConfig {
     pub repo_root: PathBuf,
     pub task: String,
     pub model: String,
-    /// Threaded through for WP4, which owns the iteration-ceiling
-    /// enforcement and its exit-3 mapping; T3.4 defines no ceiling
-    /// behaviour of its own, so this field is not read by `run` yet.
-    #[allow(dead_code)]
     pub max_iterations: u32,
+    pub budget_tokens: u64,
+    pub budget_usd: Option<f64>,
+    pub dry_run: bool,
 }
 
+#[derive(Debug)]
 pub enum LoopExit {
     Completed { summary: String, iterations: u32 },
     ProviderError { reason: String, iterations: u32 },
+    BudgetExceeded { iterations: u32 },
+    MaxIterationsExceeded { iterations: u32 },
+}
+
+/// Checked immediately before each API call, never after — a call already
+/// made has already been paid for. Strict-zero start refusal: a
+/// `budget_tokens`/`budget_usd` of exactly zero (or negative) refuses before
+/// the first call; otherwise the check compares tokens/cost already spent
+/// against the configured cap.
+fn budget_breached(cfg: &LoopConfig, ledger: &UsageLedger) -> bool {
+    if cfg.budget_tokens == 0 {
+        return true;
+    }
+    if let Some(cap) = cfg.budget_usd {
+        if cap <= 0.0 || ledger.total_cost() >= cap {
+            return true;
+        }
+    }
+    ledger.total_tokens() >= cfg.budget_tokens
 }
 
 fn system_prompt(repo_root: &std::path::Path) -> String {
@@ -62,6 +81,26 @@ pub fn run(
     let mut parse_failures: HashMap<String, u32> = HashMap::new();
 
     loop {
+        if budget_breached(cfg, &ledger) {
+            log.write(
+                event_type::BUDGET_EXCEEDED,
+                json!({
+                    "iterations": iterations,
+                    "tokens_used": ledger.total_tokens(),
+                    "budget_tokens": cfg.budget_tokens,
+                    "cost_used": ledger.total_cost(),
+                    "budget_usd": cfg.budget_usd,
+                }),
+            );
+            return (LoopExit::BudgetExceeded { iterations }, ledger);
+        }
+        if iterations >= cfg.max_iterations {
+            log.write(
+                event_type::MAX_ITERATIONS_EXCEEDED,
+                json!({"iterations": iterations, "max_iterations": cfg.max_iterations}),
+            );
+            return (LoopExit::MaxIterationsExceeded { iterations }, ledger);
+        }
         iterations += 1;
 
         let completion = match client.complete(&cfg.model, &history, &tool_defs) {
@@ -144,6 +183,7 @@ pub fn run(
             let ctx = ToolContext {
                 repo_root: &cfg.repo_root,
                 index,
+                dry_run: cfg.dry_run,
             };
 
             match tools::dispatch(&tool_name, &call.function.arguments, &ctx) {

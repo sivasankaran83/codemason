@@ -36,6 +36,7 @@ fn model_lacking_tools_exits_4_with_no_completion_call() {
     );
     let cwd = common::temp_dir("gate-no-tools");
     write_models_toml(&cwd, "vendor/no-tools");
+    common::init_git_repo(&cwd);
 
     let output = common::codemason(&cwd)
         .args([
@@ -51,12 +52,15 @@ fn model_lacking_tools_exits_4_with_no_completion_call() {
             "--api-key",
             "test-key",
         ])
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache"))
+        // Outside the repo — the catalogue cache must never dirty the
+        // worktree WP4's preflight check inspects.
+        .env("CODEMASON_CACHE_DIR", common::temp_dir("gate-no-tools-cache"))
         .output()
         .expect("run codemason run");
 
     assert_eq!(output.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     only_get_models_requests(&stub.requests());
+    common::assert_single_json_report(&output.stdout, 4);
 }
 
 /// AC6: an id absent from the provider's live catalogue exits 4 (the id IS
@@ -69,6 +73,7 @@ fn id_absent_from_catalogue_exits_4() {
     );
     let cwd = common::temp_dir("gate-absent");
     write_models_toml(&cwd, "vendor/ghost");
+    common::init_git_repo(&cwd);
 
     let output = common::codemason(&cwd)
         .args([
@@ -84,12 +89,13 @@ fn id_absent_from_catalogue_exits_4() {
             "--api-key",
             "test-key",
         ])
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache"))
+        .env("CODEMASON_CACHE_DIR", common::temp_dir("gate-absent-cache"))
         .output()
         .expect("run codemason run");
 
     assert_eq!(output.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     only_get_models_requests(&stub.requests());
+    common::assert_single_json_report(&output.stdout, 4);
 }
 
 /// AC7: an auto-router id exits 4 even though it's listed and otherwise
@@ -101,6 +107,7 @@ fn auto_router_id_exits_4() {
     );
     let cwd = common::temp_dir("gate-router");
     write_models_toml(&cwd, "openrouter/auto");
+    common::init_git_repo(&cwd);
 
     let output = common::codemason(&cwd)
         .args([
@@ -116,12 +123,13 @@ fn auto_router_id_exits_4() {
             "--api-key",
             "test-key",
         ])
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache"))
+        .env("CODEMASON_CACHE_DIR", common::temp_dir("gate-router-cache"))
         .output()
         .expect("run codemason run");
 
     assert_eq!(output.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     only_get_models_requests(&stub.requests());
+    common::assert_single_json_report(&output.stdout, 4);
 }
 
 /// AC8: an unlisted id exits 4 without `--allow-unlisted-model` and proceeds
@@ -154,6 +162,7 @@ fn unlisted_id_exits_4_without_flag_and_proceeds_with_it() {
     let stub = common::RoutedStubServer::start(routes);
     // The allowlist has a different id — "vendor/real-model" is unlisted.
     write_models_toml(&cwd, "vendor/other-model");
+    common::init_git_repo(&cwd);
 
     let base_args = [
         "run",
@@ -171,7 +180,7 @@ fn unlisted_id_exits_4_without_flag_and_proceeds_with_it() {
 
     let without_flag = common::codemason(&cwd)
         .args(base_args)
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache-a"))
+        .env("CODEMASON_CACHE_DIR", common::temp_dir("gate-unlisted-cache-a"))
         .output()
         .expect("run without flag");
     assert_eq!(
@@ -184,7 +193,7 @@ fn unlisted_id_exits_4_without_flag_and_proceeds_with_it() {
     let with_flag = common::codemason(&cwd)
         .args(base_args)
         .arg("--allow-unlisted-model")
-        .env("CODEMASON_CACHE_DIR", cwd.join("cache-b"))
+        .env("CODEMASON_CACHE_DIR", common::temp_dir("gate-unlisted-cache-b"))
         .output()
         .expect("run with flag");
     assert_eq!(
@@ -229,7 +238,10 @@ fn second_invocation_within_ttl_makes_no_network_call() {
     );
     let stub = common::RoutedStubServer::start(routes);
     write_models_toml(&cwd, "vendor/cached-model");
-    let cache_dir = cwd.join("cache");
+    common::init_git_repo(&cwd);
+    // Outside the repo and shared across both invocations — the whole point
+    // of this test is that the second invocation reuses the first's cache.
+    let cache_dir = common::temp_dir("gate-cache-ttl-cache");
 
     let args = [
         "run",
