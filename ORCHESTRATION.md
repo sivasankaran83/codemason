@@ -8,29 +8,72 @@ integrates the result.
 JSON and the exit codes are the entire interface between the two — see
 `SPEC.md`, "Nothing in this binary knows about orchestration".
 
-## Provenance of this design
+## Where this design comes from
 
-Two existing systems, combined because they solve different halves of the
-problem:
+Three sources, plus a session of real testing that settled the parts none of
+them answered.
 
-- **SWE-AF** (`github.com/Agent-Field/SWE-AF`, Apache-2.0, Public Beta) —
-  supplies the *scheduling* model: a dependency DAG topologically sorted into
-  levels, concurrent execution within a level, a hard gate between levels, and
-  one git worktree per unit of work. Verified against the primary repository
-  and README.
-- **Co-Coder** — supplies the *partitioning* model: a static-analysis
-  dependency graph partitioned by cohesion, with high in-degree files isolated
-  so that file ownership between concurrent workers is disjoint.
+- The **loop** comes from AgentFlow (arXiv:2510.05592, *In-the-Flow Agentic
+  System Optimization for Effective Planning and Tool Use*): four modules —
+  **planner, executor, verifier, generator** — coordinated by an **evolving
+  memory** across the turns of a multi-turn system.
+- The **partitioning** comes from Co-Coder: a static-analysis dependency graph
+  partitioned by cohesion, with high in-degree files isolated so that file
+  ownership between concurrent workers is disjoint.
+- The **scheduling** — a dependency DAG sorted into levels, concurrent
+  execution within a level, a hard gate between levels, one git worktree per
+  unit of work — is a pattern in general use among multi-agent engineering
+  runners. This design adopted it and validated it directly: worktree isolation
+  was built here after measuring what happens without it, and three concurrent
+  jobs then merged clean on the first attempt.
 
-The combination is deliberate. SWE-AF detects file-ownership overlap at plan
-time and then **passes it to a merger instead of using it to partition**;
-Co-Coder's measured results say that is the wrong way round. Where the two
-disagree, this design follows Co-Coder on partitioning and SWE-AF on
-scheduling.
+Where partitioning and scheduling pull apart, this design follows Co-Coder.
+Detecting file-ownership overlap at plan time and handing it to a merger rather
+than using it to partition is the wrong way round, and the session bears that
+out: partitioning prevented every conflict, while the failures that did occur
+were semantic and no merger would have caught them.
 
-**Evidence status.** SWE-AF's characterisation above is verified against
-primary sources. The comparative numbers in the appendix are extracted from
-sources but **were not adversarially verified** — the verification pass was cut
+### What is taken from AgentFlow, and what is not
+
+**Taken: the architecture.** Four modules and, more importantly, the evolving
+memory that carries state between turns.
+
+**Not taken: Flow-GRPO.** AgentFlow's headline contribution is training the
+planner *inside* the live loop with Flow-based Group Refined Policy
+Optimization, and its reported gains — roughly 14% on search, agentic and
+mathematical benchmarks with a 7B model — come from that training. Nothing here
+trains anything. Borrowing the shape of the loop does not buy those numbers,
+and this document does not claim it does.
+
+### Why the evolving memory is the part that matters here
+
+Every `codemason` process is stateless by design. It receives a task string,
+works, commits and exits, remembering nothing. Two consecutive dispatches
+against the same failing item therefore start equally blind — and that is
+precisely the failure the session hit.
+
+The Grains item took three fix cycles and never converged. Cycle 2 invented a
+NuGet package that does not exist. Cycle 3 only succeeded on that point because
+a human supplied the correct package id. **The human was the evolving memory**,
+and the loop had no other.
+
+So the memory is not decoration. It is the component that turns a sequence of
+blind retries into a loop that accumulates. What it must carry, at minimum:
+
+- what each previous cycle attempted and what the result was;
+- facts established the hard way — a package id that turned out not to exist,
+  a build flag that mattered, a convention the target repository enforces;
+- the contract surfaces already extracted, so no job re-derives them;
+- the error set from the last verification, so the next planner turn can tell a
+  shrinking error set from a shifting one.
+
+None of that lives in `codemason`, and none of it should. It belongs to the
+supervisor, and it is injected into the next task string — the single input
+channel a job has.
+
+**Evidence status.** Everything attributed to the session in this document was
+measured here. The comparative numbers in the appendix are extracted from
+published sources but **were not adversarially verified** — that pass was cut
 short deliberately. Treat them as strong leads, not settled fact, and re-check
 any number before it justifies significant work.
 
@@ -39,16 +82,29 @@ any number before it justifies significant work.
 ## The pipeline
 
 ```
-1. ANALYZE     dependency graph out of the target repository
-2. PARTITION   graph -> disjoint file-ownership groups
-3. PLAN        work items -> partitions -> DAG -> levels
-4. EXECUTE     per level: N concurrent codemason runs, isolated
-5. INTEGRATE   merge branches, run the tests, bounded fix loop
-6. REPORT      aggregate cost, status and provenance
+                                        AgentFlow module
+1. ANALYZE     dependency graph              --            setup
+2. PARTITION   disjoint file ownership       --            setup
+   ----------------------------------------------------------------
+3. PLAN        work items -> DAG -> levels   planner     \
+4. EXECUTE     N concurrent codemason runs   executor     |  the loop
+5. INTEGRATE   merge, test, bounded fix      verifier     |
+6. REPORT      cost, status, provenance      generator   /
+   ----------------------------------------------------------------
+            evolving memory spans 3-6 and persists across cycles
 ```
 
-Each stage below states what it consumes, what it produces, where it came
-from, and what the MVP actually builds versus defers.
+Stages 1 and 2 are **setup**: they run once per build and produce the
+partitions everything downstream depends on. Stages 3 to 6 are **the loop**,
+and they map one-to-one onto AgentFlow's four modules.
+
+The loop iterates. A failed verification at stage 5 returns to stage 3 with the
+memory updated, not to a blind re-dispatch — bounded at two cycles (see
+INTEGRATE), because a loop that cannot converge should escalate rather than
+spend.
+
+Each stage below states what it consumes, what it produces, where it came from,
+and what the MVP actually builds versus defers.
 
 ---
 
@@ -173,8 +229,6 @@ are the cohesion partition. Start there.
 **In:** the specification's work items plus the partitions. **Out:** a DAG of
 issues, topologically sorted into levels.
 
-From SWE-AF.
-
 1. Decompose the specification into discrete work items. Each item names its
    target repository (or monorepo section) and its acceptance check.
 2. Assign each item to a partition. **An item spanning two partitions is a
@@ -246,7 +300,7 @@ not a stylistic preference; it is forced by the interface.
 
 **In:** one level of the DAG. **Out:** one branch per item.
 
-From SWE-AF, and this maps directly onto what `codemason` already does.
+This maps directly onto what `codemason` already does.
 
 For every item in the level, concurrently:
 
@@ -265,9 +319,6 @@ Without it they share one HEAD and one index, and the failure is not a crash:
 the surviving run commits the other's in-flight edits and **reports a branch
 that does not hold its commit**, which feeds the supervisor false data. See
 `SPEC.md`, "Amendment: worktree isolation and the run summary".
-
-Convergent design worth noting: SWE-AF independently arrived at one git
-worktree per unit of work.
 
 **Concurrency limit.** Each process builds its index in memory. Size the
 per-host job count against that, not against CPU count alone.
@@ -302,13 +353,13 @@ microservices should conflict far less. **Measure your own rate first.** If it
 is low, failing loudly and re-dispatching is cheaper and far more verifiable
 than a merge agent whose output nobody can check.
 
-**MVP simplification — integrate locally, not through pull requests.** SWE-AF
-opens a PR and polls GitHub Actions until checks are conclusive. That is a
-reasonable end state, but it is deliberately out of scope for the MVP: it binds
-the supervisor to one forge, adds minutes of latency per level, and tests
-nothing that running the suite locally does not. Merge into a local integration
-branch and run the tests directly. PR creation, review gating and CI polling
-are a later layer, added once the merge-and-verify loop is proven.
+**MVP simplification — integrate locally, not through pull requests.** Opening
+a pull request and polling CI until checks are conclusive is a reasonable end
+state, but it is deliberately out of scope for the MVP: it binds the supervisor
+to one forge, adds minutes of latency per level, and tests nothing that running
+the suite locally does not. Merge into a local integration branch and run the
+tests directly. PR creation, review gating and CI polling are a later layer,
+added once the merge-and-verify loop is proven.
 
 ### Supervisor decision rule
 
@@ -384,11 +435,88 @@ exactly on a real run.
 
 ---
 
+## What to build, and what not to
+
+Settled by a real session: a greenfield .NET repository taken from an empty
+skeleton to five compiling projects across five dependency levels, 21
+`codemason` runs, $0.46 total. The orchestrator throughout was a human-driven
+LLM session. What that session actually did decides what is worth automating.
+
+### The orchestrator's work, split by kind
+
+| what the orchestrator did | kind |
+|---|---|
+| read the architecture doc, derived the level DAG | judgement |
+| extracted contract surfaces, pasted them into task text | mechanical |
+| wrote scope fences ("only this project", "read at most 2 files") | judgement |
+| chose model, budget and iteration cap per dispatch | policy |
+| dispatched with `--worktree`, ran the build gate | mechanical |
+| **diagnosed build failures to root cause** | judgement |
+| **wrote fix text naming the exact defect** | judgement |
+| merged branches, decided to escalate | mechanical + policy |
+| knew which NuGet package actually exists | world knowledge |
+
+Roughly eight meaningful interventions across 21 runs. The mechanical rows are
+most of the keystrokes; the judgement rows are most of the value.
+
+### Do not build a merge resolver
+
+**Zero textual merge conflicts occurred.** Three concurrent jobs at level 3
+merged clean, and so did every branch in the session. Every integration failure
+was a *build* failure after a clean merge — semantic, not textual.
+
+A conflict resolver would have had nothing to do. The value is entirely in the
+**verify-after-merge gate**, which is just running the project's build or test
+command. Build the gate; skip the merger.
+
+This also matches the gap in the literature: textual conflict rates are
+measured (see the appendix), semantic ones are not, and semantic is what bit us
+every time.
+
+### Three tiers
+
+**Tier 1 — into `codemason`.** Mechanical, repo-local, no model involved.
+Contract and API surface extraction, alongside `--graph` and `--partition`. It
+is the highest-value thing the session did by hand: pasting a 3 KB contract
+surface into a task turned a run that made 31 `read_file` calls and wrote
+nothing into one that committed 14 files.
+
+**Tier 2 — a separate supervisor binary, same Cargo workspace, no model.**
+Level gating, fan-out dispatch, the build gate, merge, bounded fix cycles, cost
+aggregation, escalation. All deterministic. A distinct binary rather than a
+`codemason` subcommand, because orchestration inside the worker would break the
+invariant this whole design rests on.
+
+**Tier 3 — stays with a model.** DAG derivation, task-text authoring, failure
+diagnosis, and knowing that a package id is real. Irreducible.
+
+### Why orchestration must not live inside codemason
+
+The premise that nothing in the binary knows about orchestration held up
+completely under test: the session never once needed to reach inside it. Moving
+the orchestrator in would mean a second model, nested loops and cross-loop
+budget accounting, and it would contradict the existing Must Not on planning
+and sub-agents. A worker that orchestrates itself cannot be composed.
+
+### What a supervisor will not fix
+
+It removes tedium, not judgement. Every fix that worked named the root cause;
+the one vague "the build failed, fix it" dispatch did not converge. Level 4
+shows the ceiling — three cycles, ~$0.14, no convergence, because the problem
+was external-framework knowledge rather than orchestration.
+
+The realistic gain is that a session like that one needs roughly two
+interventions instead of eight. Not zero.
+
+---
+
 ## Build order
 
 1. ~~`--graph` export and a partitioner that prints proposed partitions.~~
    **Done** — `codemason index --repo <PATH> --graph` and
    `--partition [--json]`.
+1b. Tier 1: contract/API surface extraction, so the planner stops doing it by
+   hand.
 2. Executor: one level, N concurrent `codemason run --worktree`, collect JSON.
 3. Integrator: merge, run tests, apply the decision rule above.
 4. Planner: specification to DAG. Deliberately last — it is the least certain
@@ -461,9 +589,8 @@ Conflict base rates:
   break behaviour. That evidence base does not exist yet, which is the single
   largest open risk in this design.
 
-On SWE-AF's own evidence: one self-run, self-scored benchmark on a single
-Node.js todo app, scoring 95/100 against 73 for single-agent Claude Code
-Sonnet. Not blinded, no independent replication, and the margin came
-predominantly from "Structure" and "Git hygiene" — categories that flatter an
-orchestrator by construction. Borrow the algorithm; do not treat the benchmark
-as support for it.
+A general caution on published orchestrator benchmarks: the ones encountered
+while researching this design were self-run and self-scored on a single task,
+unblinded and unreplicated, with the reported margin coming largely from
+categories that flatter an orchestrator by construction. Borrow algorithms from
+them; do not treat their numbers as support.
