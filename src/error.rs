@@ -42,4 +42,28 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("provider {model} failed after {attempts} attempts, last status {last_status}")]
+    ProviderExhausted {
+        model: String,
+        attempts: u32,
+        last_status: u16,
+    },
+
+    #[error("provider request for {model} failed: {source}")]
+    ProviderRequest {
+        model: String,
+        #[source]
+        source: anyhow::Error,
+    },
+
+    #[error("path {path} resolves outside the repository root")]
+    PathEscapesRepo { path: String },
+
+    #[error("failed to open event log {path}: {source}")]
+    LogOpen {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }

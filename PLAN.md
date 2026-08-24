@@ -1,294 +1,442 @@
-# PLAN.md — WP2: CLI, configuration, model gating
+# PLAN.md — WP3: Client, tools, loop
 
 ## Scope (restated)
 
-Everything that must be correct before a single token is spent. Three tasks:
+The read-only agent. No writes, no commands, no git — those are WP4. Five
+tasks:
 
-- **T2.1** CLI surface, `clap` **builder API** (not `derive`) — three
-  subcommands: `run` (with `--repo`, `--task`, `--model`, `--models-config`,
-  `--base-url`, `--api-key`, `--budget-tokens`, `--budget-usd`,
-  `--max-iterations`, `--branch`, `--log`, `--dry-run`,
-  `--allow-unlisted-model`, `--verbose`), `models [--check]`, and
-  `index --repo <PATH> [--stats]`. Six exit codes (0/1/2/3/4/5) as a stable
-  contract.
-- **T2.2** Allowlist: parse `models.toml` (`[[model]]` tables with `id` +
-  `role`, plus `[gating]`), resolve it from `--models-config` → `./models.toml`
-  → platform config dir, first entry is the default model.
-- **T2.3** Capability gate: fetch the provider's live model catalogue, reject
-  (exit 4) an id that's absent from it, lacks `tools` in
-  `supported_parameters`, is under the configured minimum context length, or
-  is a router/auto-select pseudo-model. Cache the catalogue fetch 24h so
-  concurrent processes don't each hit the network. `--allow-unlisted-model`
-  has a narrow, specific bypass scope (below).
+- **T3.1** Blocking LLM client: OpenAI-compatible chat completions, retry on
+  429/5xx with backoff+jitter, usage/cost accumulation keyed by model id,
+  never estimate cost the provider didn't report.
+- **T3.2** Path safety (traversal rejection, Windows long paths) and text
+  handling (line-ending/BOM detect-and-restore, elision detection, stdout
+  UTF-8).
+- **T3.3** Six tools, flat string/int schemas, one registry as the sole
+  source of truth for the tool list.
+- **T3.4** The tool-calling loop: seed system+task, call model, execute tool
+  calls in order, append one `tool` message per call, repeat; terminate on an
+  assistant message with no tool calls. In-loop error handling for malformed
+  args / unknown tool / missing usage — none of it retries the API call.
+- **T3.5** Append-only JSONL event log, flushed after every write, fixed
+  envelope and type set, no payload contents.
 
-WP3 (the LLM client and the tool-calling loop) does not exist yet. `run` in
-this package parses and validates everything up to the point a completion
-call would be made, then stops — it does not build the index, does not call
-the model, and `--dry-run`/`--budget-*`/`--branch`/`--log` are accepted and
-stored but have no effect until WP3/WP4 exist to act on them.
+Gate: AC7 ("describe the structure of this repository" completes, uses
+`context_search` before `read_file`, terminates with a summary) is called out
+in SPEC.md as the first test of the whole project's premise.
 
 ## Feasibility findings
 
-Named files from T2.1–T2.3 (`src/cli.rs`, `src/config.rs`, `models.toml`,
-`src/gating.rs`) don't exist yet — expected, this package creates them.
-`src/bin/codemason.rs` exists as WP1's placeholder `fn main() {}`.
+None of WP3's target files exist yet (`src/llm/`, `src/text.rs`,
+`src/tools/`, `src/loop.rs`, `src/log.rs`) — expected, this package creates
+them.
 
-Symbols WP2 depends on from WP1 all resolve as documented:
-`codemason_core::Index::{build, search, chunks, graph, stats}` and
-`BuildStats{indexed_files, total_chunks, languages, build_ms}` are `pub` in
-`src/index.rs`, backed by `engine::SembleIndex::{from_path, search, stats,
-chunks, graph}` in `src/engine/index/mod.rs` (confirmed by direct grep, not
-assumed). `codemason index --repo . --stats` (AC2) needs nothing new from the
-engine.
+Symbols WP3 depends on from WP1/WP2 all resolve as documented, confirmed by
+direct read rather than assumed:
 
-Dependency-tree check for the new crates this package needs: `Cargo.lock`
-already carries `clap` (4.6.6) and `ureq` (2.12.1) as *transitive* deps of
-`model2vec-rs` (WP1's always-compiled embeddings backend, per WP1's Cargo.toml
-comment), and `rustls` is present with no `native-tls`, `openssl-sys`,
-`git2`, `tokio`, or `async-std` anywhere in the tree. That means promoting
-`clap` and `ureq` to direct dependencies at those same pinned versions won't
-introduce a new major version or drag in anything the project's constraints
-forbid. `toml` (for parsing `models.toml`) isn't in the tree at all yet — new
-addition, exact version to be pinned to whatever `cargo add toml` resolves at
-implementation time rather than guessed here.
+- `codemason_core::index::Index::{build, search, chunks, graph, stats}` —
+  `search(&self, query: &str, top_k: usize) -> Vec<SearchResult>` (WP1's
+  wrapper hardcodes `alpha`/`filter_languages`/`filter_paths` to `None`,
+  matching `context_search`'s flat `query`/`max_results` schema with no
+  extra knobs to expose).
+- `engine::graph::DependencyGraph::{deps, dependents}` —
+  `deps(&self, file_path: &str) -> Option<&FileNode>` where `FileNode` carries
+  `symbols: Vec<Symbol{name, kind, line}>` and `depends_on: Vec<String>`;
+  `dependents(&self, file_path: &str) -> Vec<&str>`. This is what
+  `context_outline` reads for a file's symbol list, and what
+  `context_search` folds in as related paths (SPEC.md: "Fold
+  dependency-graph information into `context_search` results as related
+  paths" instead of separate dependency/impact tools).
+- `engine::types::{Chunk, SearchResult, MatchLine}`, `Chunk::location()` →
+  `"path:start-end"`.
+- `engine::file_walker::{walk_files, default_ignored_dirs}` and the `ignore`
+  crate's `WalkBuilder`/`OverrideBuilder` (already a pinned dependency, used
+  the same way inside `engine::file_walker`) — `list_files` reuses this
+  pattern directly rather than the engine's extension-filtered
+  `walk_files` (list_files must list *any* file, not just recognized source
+  extensions).
+- `cli::{RunArgs, ExitCode, resolve_credential}`, `config::ModelsConfig`,
+  `gating::{catalogue, check}`, `error::Error` — `bin/codemason.rs`'s
+  `run_cmd` currently stops right after gating passes
+  (`"execution loop is not implemented until WP3"`); WP3 replaces that stub
+  with the real build-index → construct-client → run-loop → emit-log
+  sequence.
+- `tests/common::StubServer` exists but only serves one fixed 200 response to
+  every request regardless of path — insufficient for WP3's retry tests
+  (429/429/200, 500×5) and for driving a full `run` invocation through both
+  `GET /models` (gating) and `POST /chat/completions` (the loop). Extending
+  it, not replacing it — `tests/gating.rs`'s existing use of
+  `StubServer::start` must keep compiling unchanged.
 
-No contradiction with SPEC.md's Current State section. The package proceeds.
+New dependencies needed, neither in the current dependency tree as a direct
+dep:
 
-## Ambiguities resolved at kickoff
+- `uuid = "=1.25.0"`, feature `v7`, for the event log's `run_id`. Not present
+  even transitively — `cargo add uuid --features v7 --dry-run` resolves
+  1.25.0 against the existing lockfile.
+- `rand = "=0.9.5"` — **already** in the tree transitively (`model2vec-rs` →
+  `hf-hub`/`tokenizers` → `rand`, confirmed via `cargo tree -i rand`; note
+  `model2vec-rs` is always-compiled per WP1's `Cargo.toml` comment, so this
+  is not a new resolution, only a promotion to direct dependency, same move
+  WP2 made for `clap`/`ureq`). Used for retry-jitter, avoiding a hand-rolled
+  entropy source.
 
-Two things in WP2's acceptance criteria aren't fully determined by SPEC.md's
-prose and materially change `gating.rs`'s behavior, so I stopped and asked
-rather than picking silently:
+`cargo tree` re-check after the two additions: still no `openssl`, `git2`,
+`tokio`/`async-std`, or embedding/array crates beyond the already-accepted
+`model2vec-rs`/`ndarray` pair from WP1. No contradiction with SPEC.md's
+Current State section. The package proceeds.
 
-**1. Router/auto-select detection (AC7).** SPEC.md never defines how to
-recognize one. Resolution: ship a small built-in default list (exact id
-`openrouter/auto`; id ends with `/auto`; id contains `auto-router`), and let
-`[gating]` extend it with a `deny_id_patterns` array of substrings — a config
-field not literally named in T2.2's list (`min_context_length`,
-`require_tool_support`, `allow_unlisted`), added because the built-in list
-alone is provider-specific and brittle. Flagging the field addition itself
-for sign-off at this gate, separately from the mechanism it implements.
+## Ambiguity resolved at kickoff
 
-**2. What `--allow-unlisted-model` actually bypasses (AC6 vs AC8).** T2.3's
-numbered check 1 ("the id is absent from the catalogue") and the sentence
-"`--allow-unlisted-model` skips check 1 only" read, taken completely
-literally, as if the flag lets an id through even when the live provider
-catalogue doesn't serve it at all — which would leave checks 2–4
-(tools/context/router) with no data to evaluate. That reading also makes
-AC6 ("an absent id exits 4") and AC8 ("an unlisted id exits 4 without the
-flag, proceeds with it") test the identical scenario under two names, which
-is an unlikely thing for two separate ACs to do. Resolution, confirmed:
-these are two distinct checks, only one of which SPEC.md numbers explicitly.
+**Tool registry scope in WP3 vs WP4.** T3.3's table lists all six tools,
+`write_file` and `run_command` annotated "WP4", but WP3's own scope line says
+"no writes, no commands" and T3.3's file list has no `exec.rs`. Confirmed:
+**register all six schemas now**; `write_file`/`run_command` handlers return
+a descriptive "not available until WP4" tool-result error rather than acting
+— the model can read that and continue, per the errors-are-not-failures
+design invariant. This satisfies AC6 ("every tool's JSON schema...") against
+the full, final six-tool set from this package onward and matches the "at
+most six, fixed up front" framing in CLAUDE.md, rather than growing the
+registry's shape between packages. WP4 swaps the two stub handlers for real
+`fs.rs`/`exec.rs` logic without touching the schemas.
 
-- **Allowlist membership** — is `--model <id>` present in the resolved
-  `models.toml`? This is the *unnumbered*, earlier check. Skipped by
-  `--allow-unlisted-model` (this is what "`allow_unlisted`" as a config field
-  name, and "`--allow-unlisted-model`" as a flag name, both actually refer
-  to). AC8's scenario.
-- **Catalogue presence** — is the id in the *provider's live `/models`
-  response* at all? This is T2.3's numbered check 1. Always enforced,
-  no flag bypasses it — an id the provider doesn't serve has no data for
-  checks 2–4 to run against regardless of operator intent. AC6's scenario.
+## Other inferences (flagged, not asked — same treatment WP2 gave the
+`/models` endpoint path)
 
-So the full sequence for a given `--model <id>` is: allowlist membership
-(skippable) → fetch/cache catalogue → catalogue presence (check 1, not
-skippable) → tools (check 2, not skippable, ever) → context length
-(check 3) → router pattern (check 4).
-
-**3. AC4 needs a live provider.** `models --check` "against a live
-catalogue" requires a real base URL and API key; this sandbox has neither
-configured. You said you'll provide credentials before Verify. AC5–AC9 don't
-need this — they're driven by a local stub HTTP server (no new dependency;
-hand-rolled on `std::net::TcpListener`, mirroring what WP3's AC2 will need
-for the real LLM client) that returns fabricated catalogue responses and
-records whether a completions-shaped request ever arrives. AC4 itself will
-be run once by hand against whatever you provide and reported directly in
-the AC table, not wired into `cargo test` (a test that silently needs a
-secret to pass is worse than an explicit manual step).
+1. **Chat completions endpoint & usage flag.** `POST {base_url}/chat/completions`,
+   OpenAI-compatible, mirroring WP2's `{base_url}/models` convention.
+   SPEC.md's "usage-inclusion flag" is read as OpenRouter's
+   `"usage": {"include": true}` request field — the one OpenRouter-specific
+   flag that both guarantees a `usage` block on a non-streaming response *and*
+   adds a provider-reported `cost` field, which is what makes "accumulate...
+   cost, keyed by model id" (T3.1) meaningful without ever estimating it
+   ourselves. Sent unconditionally; unknown fields are ignored by
+   OpenAI-compatible endpoints that don't recognize it.
+2. **Retry/backoff formula.** `delay = min(60s, base=1s * 2^attempt) + jitter`,
+   jitter drawn from `rand` (now a direct dep) as `0..=250ms`, attempts
+   capped at 5. Only `429` and `5xx` HTTP statuses retry; anything else
+   (4xx other than 429, connection failure) is a single-shot provider error.
+3. **Elision markers.** Case-insensitive substring match for the three
+   literal marker phrases from SPEC.md's own backticked text — `"... rest of"`,
+   `"unchanged"`, `"... existing"` — combined with the `new.len() <
+   existing.len() / 2` length check. `write_file` doesn't exist as working
+   code until WP4, but the detection function itself is T3.2's, tested
+   directly against strings.
+4. **Windows long-path support.** `std::fs::canonicalize` already returns
+   `\\?\`-prefixed verbatim paths on Windows, which is what actually lifts
+   the 260-char `MAX_PATH` limit — there is no additional opt-in needed, and
+   none is added. `text.rs`'s path-safety function canonicalizes before any
+   filesystem call, so this falls out for free. Verified by AC3's own test
+   (a path over 260 chars, read via this path).
+5. **Stdout UTF-8, without `unsafe_code`.** `unsafe_code = "deny"` is a lint
+   on *this crate's* code, not on dependencies, but pulling in a
+   console/terminal crate just to call `SetConsoleOutputCP` for one line is
+   more than this needs. Rust's `std::io::Stdout` on Windows already routes
+   through `WriteConsoleW` (UTF-16, codepage-independent) whenever stdout is
+   an actual console, and raw bytes whenever it's redirected to a file or
+   pipe (the JSON-report case, where codepage is irrelevant since the reader
+   decodes UTF-8 itself). "Set stdout to UTF-8 explicitly" is implemented as:
+   always write pre-encoded UTF-8 bytes via `write_all`, never anything
+   locale-dependent (`println!` with formatting that could go through a
+   lossy codec) — no FFI, no `unsafe`.
+6. **Default `--log` path when omitted.** `<repo>/.agent/log/run-<run_id>.jsonl`.
+   Not named in SPEC.md; inferred from T3.3's "Always excludes `.git/` and
+   `.agent/`" in `list_files`, which implies `.agent/` is this tool's own
+   working area inside the target repo. Parent directories created as
+   needed.
+7. **`--verbose`.** No WP3 acceptance criterion exercises it (WP4's AC9 only
+   asserts it adds nothing to *stdout*). Implemented as: echo each tool call
+   and its result's size/truncation to stderr as it happens. Low-risk,
+   reversible if this reads wrong at the gate.
+8. **`max_iterations` is threaded into `LoopConfig` but not enforced in
+   WP3.** T4.4 owns "enforce a hard iteration ceiling" and the exit-3
+   mapping; T3.4 defines no ceiling behaviour. The loop runs until a
+   no-tool-call message or one of T3.4's own abort conditions (three
+   consecutive same-tool parse failures, three consecutive missing-usage
+   responses) fires. No ad hoc cap is added in its place — that would be
+   guessing at WP4's contract. Practical effect: WP3's own automated tests
+   use finite fabricated stub traces, so nothing in `cargo test` can hang;
+   AC7 against a live model is exercised manually (see Test strategy).
 
 ## Approach
 
-### New dependencies (`Cargo.toml`)
+### `Cargo.toml`
 
 ```toml
-clap = "=4.6.6"                                            # builder API — Command/Arg, not #[derive(Parser)]
-toml = "=<resolved>"                                       # models.toml parsing — pin whatever `cargo add` resolves
-ureq = { version = "=2.12.1", default-features = false, features = ["json", "tls"] }
+uuid = { version = "=1.25.0", features = ["v7"] }
+rand = "=0.9.5"
 ```
 
-`ureq`'s `tls` feature is its rustls backend (not `native-tls`) —
-`default-features = false` makes that an explicit choice rather than
-something that happens to be true of the current default feature set, since
-"rustls only" is a hard constraint checked at Milestone Validation, not just
-WP1. Re-run the `cargo tree` grep for `openssl`/`native-tls`/`tokio` after
-adding these, same as WP1's AC2 check.
+### `src/llm/types.rs`
 
-### `src/cli.rs` + `src/bin/codemason.rs`
+Wire types for the OpenAI-compatible chat completions shape actually used:
+`ChatMessage { role: String, content: Option<String>, tool_calls:
+Option<Vec<ToolCall>>, tool_call_id: Option<String>, name: Option<String> }`
+(the last two populate outgoing `tool` role messages), `ToolCall { id,
+r#type: "function", function: FunctionCall{name, arguments: String} }`,
+`ToolDef { r#type: "function", function: FunctionSpec{name, description,
+parameters: serde_json::Value} }`, `Usage { prompt_tokens, completion_tokens,
+total_tokens, cost: Option<f64> }` (all fields tolerant of absence —
+`#[serde(default)]` — since "absent or malformed usage" must not panic),
+request/response envelope structs.
 
-`clap::Command` builder tree: root `codemason` with three subcommands.
-`run`'s `--task` accepts `TEXT|@FILE` — a leading `@` means "read task text
-from this file path" (resolved relative to the current working directory,
-consistent with `--models-config`/`--log`, not the target `--repo`, since the
-task file is the operator's, not the target repository's).
-
-`--base-url` / `--api-key` env fallbacks: `CODEMASON_BASE_URL` /
-`CODEMASON_API_KEY`. Not named in SPEC.md — inference, flagged for sign-off.
-(Not `OPENAI_*`: the base URL is explicitly arbitrary-provider, and reusing
-OpenAI's own env var names on a non-OpenAI endpoint would be misleading.)
-
-`main()` stays thin: build the CLI, parse, dispatch to `config`/`gating`/
-`index`, map the `Result` to one of the six exit codes via
-`std::process::exit`. Exit-code mapping lives in `src/cli.rs` next to the
-subcommand definitions (`enum ExitCode` mirroring SPEC's table), not
-scattered across call sites.
-
-`run`'s WP2 body: parse flags → resolve `models.toml` via `config::resolve`
-→ resolve `--model` (or the allowlist's first/default entry) → resolve
-`base_url`/`api_key` (flag, else env, else error) → `gating::check(...)` →
-on `Err`, print the rejection reason to stderr, exit 4 → on `Ok`, print
-`"model {id} passed gating; execution loop is not implemented until WP3"` to
-stderr, exit 0. `--dry-run` etc. are parsed and stored on the config struct,
-unused this package — still listed in `--help` (AC1 needs every documented
-flag to appear, not to do anything yet).
-
-### `src/config.rs`
+### `src/llm/mod.rs`
 
 ```rust
-pub struct ModelEntry { pub id: String, pub role: String }
-pub struct GatingConfig {
-    pub min_context_length: u64,
-    pub require_tool_support: bool,
-    pub allow_unlisted: bool,
-    pub deny_id_patterns: Vec<String>,   // new field, see Ambiguity 1
-}
-pub struct ModelsConfig { pub models: Vec<ModelEntry>, pub gating: GatingConfig }
+pub struct Client { base_url: String, api_key: String, http: ureq::Agent }
+pub struct CompletionResult { pub message: ChatMessage, pub usage: Option<Usage> }
+pub struct Totals { pub prompt: u64, pub completion: u64, pub total: u64, pub cost: f64 }
 
-pub fn resolve(explicit: Option<&Path>) -> Result<(PathBuf, ModelsConfig), Error>;
+impl Client {
+    pub fn new(base_url: String, api_key: String) -> Self;
+    pub fn complete(&self, model: &str, messages: &[ChatMessage], tools: &[ToolDef])
+        -> Result<CompletionResult, Error>;
+}
+
+pub struct UsageLedger { totals_by_model: HashMap<String, Totals> }
+impl UsageLedger {
+    pub fn record(&mut self, model: &str, usage: Option<&Usage>);
+    pub fn totals(&self) -> &HashMap<String, Totals>;
+}
 ```
 
-Resolution: if `--models-config` is given, use exactly that path — error
-naming it if missing/malformed, no fallback (an explicit path is the operator
-pointing at a specific file; silently falling through past it would hide a
-typo). Otherwise try `./models.toml`, then
-`dirs::config_dir()/codemason/models.toml` in order; first one that exists
-wins. If none exist, exit 1 listing every path that was tried (AC3). Malformed
-TOML at whichever path was chosen: exit 1 naming the file path and the
-`toml` crate's parse error (line/column included, since `toml`'s error type
-carries it).
+`complete` builds the request body (`model`, `messages`, `tools`,
+`tool_choice: "auto"`, `usage: {"include": true}`), POSTs with `ureq`,
+retries `429`/`5xx` per the backoff formula above, and on the 5th exhausted
+attempt returns `Error::ProviderExhausted { model, attempts, last_status }` —
+a new `error.rs` variant the caller (the loop) maps straight to exit 5. A
+non-retryable status (other 4xx, transport error) returns a distinct
+`Error::ProviderRequest` variant on the first attempt, also mapped to exit 5
+by the caller — SPEC.md's Must list only names *retries* for 429/5xx,
+nothing about tolerating a hard 4xx.
 
-### `src/gating.rs`
+Parsing tolerates an absent/malformed `usage` object: `Option<Usage>::None`
+if missing or if the JSON shape doesn't parse, never a panic — the loop
+layer is what turns three consecutive `None`s into an abort.
+
+### `src/text.rs`
 
 ```rust
-pub struct CatalogueEntry {
-    pub id: String,
-    pub context_length: u64,
-    pub supported_parameters: Vec<String>,
+pub fn to_repo_relative(repo_root: &Path, raw: &str) -> Result<PathBuf, Error>; // canonicalize + traversal check
+pub fn normalize_slashes(path: &str) -> String;
+
+pub enum LineEnding { Lf, Crlf }
+pub struct ReadPresentation { pub content: String, pub line_ending: LineEnding, pub had_bom: bool }
+pub fn read_for_model(bytes: &[u8]) -> ReadPresentation;      // BOM strip, CRLF->LF, detect dominant ending
+pub fn restore_for_write(content_lf: &str, ending: LineEnding, had_bom: bool) -> Vec<u8>;
+
+pub fn looks_elided(existing: &str, new_content: &str) -> bool;
+
+pub fn init_stdout_utf8();  // documents/enforces the write_all-only discipline; see inference 5
+```
+
+`to_repo_relative` canonicalizes `repo_root` once, joins the raw
+(forward-slash-normalized) path, canonicalizes the result, and rejects with
+an `Error::PathEscapesRepo` value (never a panic) if it doesn't start with
+the canonicalized root — every tool in `tools/fs.rs` and `tools/context.rs`
+routes paths through this before touching the filesystem.
+
+### `src/tools/mod.rs`
+
+```rust
+pub struct ToolDef { pub name: &'static str, pub description: &'static str, pub schema: serde_json::Value }
+pub fn registry() -> Vec<ToolDef>;               // the six, in the SPEC.md table's order
+pub fn as_llm_tool_defs() -> Vec<llm::ToolDef>;   // registry() reshaped for the wire format
+
+pub enum ToolOutcome { Ok(String), Error(String) }  // Error still becomes a normal `tool` message
+pub fn dispatch(name: &str, args_json: &str, ctx: &ToolContext) -> DispatchResult;
+pub enum DispatchResult { Ran(ToolOutcome), UnknownTool, BadArguments(String) }
+```
+
+Every schema: `{"type":"object","properties":{...only "type":"string" or
+"type":"integer" values...},"required":[...]}` — no nested `object`/`array`
+property ever appears, checked by AC6's test walking the `serde_json::Value`
+one level deep. `write_file`/`run_command` are present in `registry()` with
+real schemas (`path`+`content`; `command`+`timeout_seconds`) but `dispatch`
+returns `ToolOutcome::Error("write_file is not available until WP4")` /
+same for `run_command`, per the resolved ambiguity above.
+
+### `src/tools/context.rs`
+
+- `context_search(query, max_results)`: `index.search(query, top_k)` where
+  `top_k = if max_results == 0 { 10 } else { max_results as usize }` (0 = "use
+  a sensible default", consistent with `read_file`'s existing 0-means-unbounded
+  convention for line numbers, not literally zero results). Formats each
+  result as `path:start-end (score=..)` + a short preview (first ~3 content
+  lines) + related paths folded in from `graph.deps(file_path).depends_on`
+  and `graph.dependents(file_path)`, only when non-empty.
+- `context_outline(path)`: `to_repo_relative` then `graph.deps(&normalized)`;
+  `None` → `ToolOutcome::Error("no outline available for {path}")` (unsupported
+  language or file not in the index — not a panic); `Some(node)` → one line
+  per `Symbol{kind, name, line}`, plus `depends_on`.
+
+### `src/tools/fs.rs`
+
+- `read_file(path, start_line, end_line)`: `to_repo_relative`, read bytes,
+  refuse if a null byte appears in the first 8 KB (`ToolOutcome::Error`,
+  "binary file"), else `text::read_for_model`, slice `start_line..=end_line`
+  (`0` = open end per SPEC.md), cap the slice at 2000 lines with a truncation
+  note appended, number each line `"NNNN: ..."`.
+- `list_files(path, pattern, max_results)`: `to_repo_relative` for `path`
+  (root of the walk, `"."` default), `ignore::WalkBuilder` with
+  `default_ignored_dirs()` plus `.git`/`.agent` always excluded, an
+  `OverrideBuilder` glob from `pattern` when non-empty, capped at
+  `max_results` (0 → default 100).
+- Stub `write_file`/`run_command` handlers live in `tools/mod.rs`'s
+  `dispatch`, not here — there is no real filesystem-mutating or
+  process-spawning code to justify a WP3 `fs.rs` entry for them, and putting
+  the stub message next to the schema keeps the "not available until WP4"
+  behaviour in one obvious place.
+
+### `src/loop.rs`
+
+```rust
+pub struct LoopConfig {
+    pub repo_root: PathBuf,
+    pub task: String,
+    pub model: String,
+    pub max_iterations: u32,   // threaded through, unenforced this package — inference 8
 }
-
-pub fn fetch_catalogue(base_url: &str, api_key: &str) -> Result<Vec<CatalogueEntry>, Error>;
-// GET {base_url}/models, Authorization: Bearer {api_key}, JSON `{"data": [...]}`
-// (OpenAI/OpenRouter list-endpoint convention — SPEC doesn't name the path,
-// flagged for sign-off same as WP1's package-naming inference).
-
-pub struct GateRejection { pub reason: String }
-
-pub fn check(
-    id: &str,
-    allow_unlisted: bool,
-    allowlist: &[ModelEntry],
-    gating: &GatingConfig,
-    catalogue: &[CatalogueEntry],
-) -> Result<(), GateRejection>;
+pub enum LoopExit {
+    Completed { summary: String, iterations: u32 },
+    ProviderError { reason: String, iterations: u32 },
+}
+pub fn run(
+    cfg: &LoopConfig,
+    client: &llm::Client,
+    index: &Index,
+    log: &mut log::EventLog,
+) -> (LoopExit, llm::UsageLedger);
 ```
 
-Cache: `dirs::cache_dir()/codemason/catalogue/<sanitized-base-url>.json`,
-storing `{fetched_at: RFC3339, entries: [...]}` via `serde`. 24h TTL measured
-against `fetched_at`. A fetch failure with a valid (even if expired-by-clock
-but present) cache entry is non-fatal — spec says "non-fatal only with a
-valid cache entry," read as *present*, not as *unexpired*, since the whole
-point of falling back is the network being unavailable. Sanitization is a
-simple non-alphanumeric-to-`_` pass on the base URL string, just enough to
-be a legal filename — not a hash, so the cache file stays human-inspectable.
+History seeded with the system message (repo path + the three-tool discovery
+order + "reply with a summary and no tool calls when done", verbatim per
+T3.4) and a user message holding `task`. Each turn: log `llm_call`, call
+`client.complete`; on `Err` → log `run_failed`, return `ProviderError`
+(caller maps to exit 5). On success: append the full assistant message
+as-is (content *and* `tool_calls` together, per SPEC.md, not split apart).
+No `tool_calls` → `Completed`. Otherwise, for each call in order: parse
+`arguments` as JSON — failure appends a `tool` message describing exactly
+what was wrong, increments a per-tool-name consecutive-failure counter, and
+if that counter hits 3, returns `ProviderError`; success resets that
+counter. Unknown tool name → `tool` message listing the six valid names, no
+abort (SPEC.md only names three-consecutive-same-tool-parse-failures and
+three-consecutive-missing-usage as abort conditions — an unknown name isn't
+one of them). Missing/malformed usage on a response increments a separate
+whole-run counter; 3 consecutive → `ProviderError`; any response with valid
+usage resets it to 0.
 
-### `models.toml` (sample, repo root)
+### `src/log.rs`
 
-```toml
-# Placeholder ids. Real ids MUST be validated with `codemason models --check`
-# before use — this file is not fetched or trusted blindly.
-
-[[model]]
-id = "REPLACE_ME/example-primary-model"
-role = "primary"
-
-[[model]]
-id = "REPLACE_ME/example-fallback-model"
-role = "fallback"
-
-[gating]
-min_context_length = 32000
-require_tool_support = true
-allow_unlisted = false
-# deny_id_patterns extends the built-in router/auto-select denylist
-# (openrouter/auto, ids ending "/auto", ids containing "auto-router").
-deny_id_patterns = []
+```rust
+pub struct EventLog { writer: BufWriter<File>, run_id: Uuid, seq: u64 }
+impl EventLog {
+    pub fn open(path: &Path, run_id: Uuid) -> Result<Self, Error>;
+    pub fn write(&mut self, event_type: &str, fields: serde_json::Value); // envelope + flush, one line
+}
 ```
+
+One `write_all` of the fully-formed line (`{ts, run_id, seq, type, ...fields}`
+serialized once) plus a line count under Windows terminates lines with a
+single `flush()` right after — nothing is buffered across calls, satisfying
+"flushed after every write" and keeping a mid-kill log's earlier lines
+independently parseable. `seq` starts at 1 and increments per call,
+contiguous by construction (single writer, no concurrent writers within one
+process). Event field payloads follow SPEC.md's "sizes and truncation
+flags, never file contents or full tool results" — e.g. `tool_result` logs
+`{tool, ok, result_chars, truncated}`, never the string itself;
+`run_started` logs `{repo, model, task_chars}`, never the task text.
+`budget_exceeded`/`max_iterations_exceeded`/`model_gated`/`model_unlisted`
+variant *names* exist in this file's event-type set now (SPEC.md lists all
+of them under T3.5 as WP3's job to define), but nothing in WP3 emits the
+budget/iteration ones — WP4 wires those call sites when the enforcement
+they describe actually exists.
+
+### `src/bin/codemason.rs`
+
+`run_cmd`, after `gating::check` passes: resolve `--log` (or the
+`.agent/log/run-<uuid>.jsonl` default), open the `EventLog`, log
+`run_started`; `Index::build(&args.repo)` (mapping build failure to
+`ExitCode::UnrecoverableError` same as `index_cmd` already does), log
+`index_built`; construct `llm::Client`; call `loop_::run`; on `Completed`,
+print the summary to stdout, log `run_completed`, exit 0; on
+`ProviderError`, log already written by `loop_::run`, exit 5.
 
 ### `src/error.rs` additions
 
-New variants: `ConfigNotFound { searched: Vec<PathBuf> }`,
-`ConfigParse { path: PathBuf, source: toml::de::Error }`,
-`CatalogueFetch(ureq::Error)`, `ModelGated(GateRejection)`,
-`MissingCredential(&'static str)` (for absent `--api-key`/`--base-url` with
-no env fallback). No reference to any external crate's exit-code type, per
-T1.2's rule carried forward.
+`ProviderExhausted { model, attempts, last_status }`,
+`ProviderRequest { model, source }`, `PathEscapesRepo { path }`,
+`LogOpen { path, source }` — no reference to any external crate's own error
+or exit-code type, carried forward from T1.2/T2's rule.
 
 ## Test strategy, by acceptance criterion
 
-- **AC1** `Command::new(env!("CARGO_BIN_EXE_codemason")).arg("--help")` —
-  assert stdout contains `run`, `models`, `index`, and every documented flag
-  string.
-- **AC2** Integration test: `codemason index --repo <fixture> --stats`
-  against the same `old_source` C# fixture WP1 used (same on-disk-only
-  caveat), assert exit 0 and plausible fields in the printed stats.
-- **AC3** Unit tests in `config.rs`: well-formed file → ordered `Vec`
-  matching file order; syntactically broken TOML → `Err` naming file + parse
-  error; no file at any searched location → `Err` listing all searched
-  paths.
-- **AC4** Manual — run by hand once real credentials are available, result
-  recorded directly in the AC table.
-- **AC5–AC8** Local stub server (`TcpListener`, hand-rolled minimal HTTP,
-  same approach WP3 will reuse) serving a fabricated `/models` catalogue per
-  scenario (no `tools` in `supported_parameters`; id absent entirely; id
-  matching a router pattern; id absent from `models.toml` with/without
-  `--allow-unlisted-model`). Drive each through `codemason run`, assert the
-  exit code, and assert the stub's request log contains only the `GET
-  /models` call — no completions-shaped `POST`, satisfying the package
-  gate's explicit demand to prove that rather than infer it from the exit
-  code alone.
-- **AC9** Same stub, request counter. Two `codemason run` invocations
-  against the same `--base-url` inside the TTL: assert exactly one `GET
-  /models` total across both.
+- **AC1** `tests/llm_client.rs`: extended stub answers one `POST
+  /chat/completions` with a canned assistant message + usage block;
+  `Client::complete` called directly (library-level, no CLI spawn); assert
+  the parsed message and `usage.total_tokens > 0`.
+- **AC2** Same file: (a) stub sequence `[429, 429, 200]` on
+  `/chat/completions` → `complete` succeeds, asserted attempt count == 3; (b)
+  `[500, 500, 500, 500, 500]` → `Err(ProviderExhausted)`; (c) a `200`
+  response with the `usage` key stripped from the JSON body → `complete`
+  still returns `Ok` with `usage: None`, no panic.
+- **AC3** `src/text.rs` unit tests, `#[cfg(test)] mod tests`, same convention
+  as `config.rs`/`gating.rs`: traversal (`../../etc`) rejected as `Err`, not
+  panic; a CRLF fixture round-trips CRLF; a BOM fixture round-trips with BOM;
+  an LF fixture's write path never introduces `\r\n`; `looks_elided` true at
+  40% length with each of the three markers present, false without any
+  marker; a synthetic path exceeding 260 chars (nested temp dirs) reads
+  successfully through `to_repo_relative`.
+- **AC4/AC5** `src/tools/context.rs` unit tests against the real C# fixture
+  under `old_source/` (same skip-if-absent pattern as `index.rs`'s AC4/AC5
+  tests) — `context_search` for a known symbol returns it as the first
+  result; `context_outline` on a known file lists its expected member
+  symbols.
+- **AC6** `src/tools/mod.rs` unit test: for each of the six `ToolDef`s, walk
+  `schema["properties"]` one level and assert every value's `"type"` is
+  `"string"` or `"integer"`, and that no property value itself contains a
+  nested `"properties"` or `"items"` key.
+- **AC7** Two parts, per the resolved-ambiguity precedent WP2 set for AC4:
+  (a) `tests/loop_.rs`, automated — a fabricated multi-turn stub trace
+  (assistant calls `context_search`, then `read_file`, then answers with no
+  tool calls) drives `loop_::run` directly and asserts the call order and
+  that it terminates `Completed`; this proves the loop's *mechanics*, not a
+  live model's judgment. (b) A real `codemason run --repo . --task "Describe
+  the structure of this repository"` against a live provider, run by hand
+  once credentials are available, reported directly in the AC table — same
+  treatment as WP2's AC4.
+- **AC8** `tests/loop_.rs`: a stub trace with one malformed-JSON tool-call
+  response and one unknown-tool-name response, each followed by a normal
+  terminating response — assert the run completes normally (no panic, no
+  premature abort, since two isolated bad calls don't reach the
+  three-consecutive threshold).
+- **AC9** `tests/event_log.rs`: (a) a full completed run's log file, parsed
+  line by line, has contiguous `seq` and contains at least one each of
+  `run_started`, `index_built`, `llm_call`, `run_completed`; (b) spawn
+  `codemason run` against a stub that stalls for several iterations, kill
+  the child mid-run (`Child::kill()`), then parse the log — every line
+  except possibly a truncated final one must parse as valid JSON.
 
 ## Risk flags
 
-1. **`clap` builder API, not `derive`** — SPEC.md T2.1 says "builder API"
-   explicitly; noting it because `derive` is the more common default choice
-   and I want the constraint on record before writing code against it.
-2. **`CODEMASON_BASE_URL`/`CODEMASON_API_KEY` env var names** are an
-   inference, not a spec quote.
-3. **Catalogue endpoint path** (`{base_url}/models`, OpenAI/OpenRouter list
-   convention) is an inference — SPEC.md names the *response fields*
-   (`context_length`, `supported_parameters`) but never the path.
-4. **`deny_id_patterns` is a new `models.toml` field** beyond T2.2's literal
-   three (`min_context_length`, `require_tool_support`, `allow_unlisted`) —
-   product of resolving Ambiguity 1 above, flagged again here since it
-   changes the shipped sample file's shape.
-5. **Cache file location/format/sanitization scheme** under
-   `dirs::cache_dir()` is an inference — SPEC.md specifies the 24h TTL and
-   the non-fatal-with-valid-cache behavior but not the storage mechanism.
-6. **AC4 is not automated** — needs a live credential this sandbox doesn't
-   have; will be exercised manually once provided and reported as an actual
-   run result, not skipped silently.
-7. **`toml` crate version** is unpinned in this plan pending `cargo add`'s
-   resolution at implementation time — consistent with how WP1 handled
-   already-pinned engine deps versus this package's genuinely new ones.
+1. **Endpoint path and `usage.include` flag are inferences** (same category
+   as WP2's `/models` path) — flagged for sign-off.
+2. **Retry/backoff exact formula** (base 1s, ×2 each attempt, 60s cap, 5
+   attempts, 0–250ms jitter) is my own construction of "exponential backoff
+   and jitter" — SPEC.md gives the four numeric bounds but not the formula
+   shape.
+3. **Elision marker strings** are read literally from SPEC.md's own
+   backticked examples; a marker set that differs from what a real model
+   actually writes (e.g. "rest remains the same") would still slip through
+   undetected until WP4 exercises this against real model output.
+4. **`--log` default path under `.agent/`** is inferred, not spec'd.
+5. **AC7 is only partially automated** — the live-model half needs
+   credentials this sandbox doesn't have; flagged the same way WP2 flagged
+   its AC4.
+6. **`max_iterations` unenforced this package** (inference 8 above) — if
+   this reading is wrong and WP3 was expected to cap iterations itself, that
+   changes `loop.rs`'s public shape before WP4 extends it.
+7. **`StubServer` extension changes shared test infrastructure**
+   (`tests/common/mod.rs`) that `tests/gating.rs` already depends on — the
+   plan is additive (new methods, `StubServer::start` untouched) specifically
+   to avoid destabilizing WP2's passing tests, but it's still a shared-file
+   edit worth flagging.

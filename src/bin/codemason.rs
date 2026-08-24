@@ -1,5 +1,7 @@
 use codemason_core::cli::{self, ExitCode, RunArgs, API_KEY_ENV, BASE_URL_ENV};
-use codemason_core::{config, gating, Error, Index};
+use codemason_core::log::{event_type, EventLog};
+use codemason_core::{config, gating, llm, Error, Index, LoopConfig, LoopExit};
+use uuid::Uuid;
 
 fn main() {
     let matches = cli::build().get_matches();
@@ -80,10 +82,69 @@ fn run_cmd(sub: &clap::ArgMatches) -> ExitCode {
         return ExitCode::ModelGated;
     }
 
-    eprintln!(
-        "model {model_id} passed gating; execution loop is not implemented until WP3"
+    let run_id = Uuid::now_v7();
+    let log_path = args
+        .log
+        .clone()
+        .unwrap_or_else(|| args.repo.join(".agent").join("log").join(format!("run-{run_id}.jsonl")));
+    let mut event_log = match EventLog::open(&log_path, run_id) {
+        Ok(log) => log,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::UnrecoverableError;
+        }
+    };
+    event_log.write(
+        event_type::RUN_STARTED,
+        serde_json::json!({
+            "repo": args.repo.to_string_lossy(),
+            "model": model_id,
+            "task_chars": args.task.len(),
+        }),
     );
-    ExitCode::Completed
+
+    let index = match Index::build(&args.repo) {
+        Ok(index) => index,
+        Err(Error::IndexBuild(err)) => {
+            eprintln!("error: failed to build index: {err}");
+            return ExitCode::UnrecoverableError;
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::UnrecoverableError;
+        }
+    };
+    event_log.write(
+        event_type::INDEX_BUILT,
+        serde_json::json!({
+            "indexed_files": index.stats().indexed_files,
+            "total_chunks": index.stats().total_chunks,
+            "build_ms": index.stats().build_ms,
+        }),
+    );
+
+    let client = llm::Client::new(base_url, api_key);
+    let loop_cfg = LoopConfig {
+        repo_root: args.repo.clone(),
+        task: args.task.clone(),
+        model: model_id,
+        max_iterations: args.max_iterations,
+    };
+
+    let (exit, _ledger) = codemason_core::run_loop(&loop_cfg, &client, &index, &mut event_log);
+    match exit {
+        LoopExit::Completed { summary, iterations } => {
+            if args.verbose {
+                eprintln!("completed after {iterations} iteration(s)");
+            }
+            eprintln!("{summary}");
+            ExitCode::Completed
+        }
+        LoopExit::ProviderError { reason, iterations } => {
+            eprintln!("provider error after {iterations} iteration(s): {reason}");
+            ExitCode::ProviderError
+        }
+    }
 }
 
 fn models_cmd(sub: &clap::ArgMatches) -> ExitCode {

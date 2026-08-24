@@ -126,12 +126,32 @@ fn auto_router_id_exits_4() {
 
 /// AC8: an unlisted id exits 4 without `--allow-unlisted-model` and proceeds
 /// (exit 0) with it, given the id is otherwise valid in the live catalogue.
+///
+/// Exit 0 now means the whole WP3 loop ran to completion, not just that
+/// gating passed (that was WP2's contract, before `run` did anything past
+/// gating) — so this needs a repo with a real source file plus a
+/// `/chat/completions` route that terminates immediately with no tool
+/// calls, not just a `/models` catalogue.
 #[test]
 fn unlisted_id_exits_4_without_flag_and_proceeds_with_it() {
-    let stub = common::StubServer::start(
-        r#"{"data":[{"id":"vendor/real-model","context_length":32000,"supported_parameters":["tools"]}]}"#,
-    );
     let cwd = common::temp_dir("gate-unlisted");
+    std::fs::write(cwd.join("a.rs"), "fn main() {}\n").unwrap();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "/models",
+        vec![common::StubResponse::json(
+            200,
+            r#"{"data":[{"id":"vendor/real-model","context_length":32000,"supported_parameters":["tools"]}]}"#,
+        )],
+    );
+    routes.insert(
+        "/chat/completions",
+        vec![common::StubResponse::json(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )],
+    );
+    let stub = common::RoutedStubServer::start(routes);
     // The allowlist has a different id — "vendor/real-model" is unlisted.
     write_models_toml(&cwd, "vendor/other-model");
 
@@ -176,12 +196,38 @@ fn unlisted_id_exits_4_without_flag_and_proceeds_with_it() {
 }
 
 /// AC9: a second invocation within the TTL makes no network call.
+///
+/// Exit 0 now means the whole WP3 loop ran to completion (see the comment
+/// on `unlisted_id_exits_4_without_flag_and_proceeds_with_it`), so both
+/// runs need a repo with a real source file and a `/chat/completions` route
+/// that terminates immediately — the assertion under test is still only
+/// about the `/models` fetch count.
 #[test]
 fn second_invocation_within_ttl_makes_no_network_call() {
-    let stub = common::StubServer::start(
-        r#"{"data":[{"id":"vendor/cached-model","context_length":32000,"supported_parameters":["tools"]}]}"#,
-    );
     let cwd = common::temp_dir("gate-cache-ttl");
+    std::fs::write(cwd.join("a.rs"), "fn main() {}\n").unwrap();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "/models",
+        vec![common::StubResponse::json(
+            200,
+            r#"{"data":[{"id":"vendor/cached-model","context_length":32000,"supported_parameters":["tools"]}]}"#,
+        )],
+    );
+    routes.insert(
+        "/chat/completions",
+        vec![
+            common::StubResponse::json(
+                200,
+                r#"{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            ),
+            common::StubResponse::json(
+                200,
+                r#"{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            ),
+        ],
+    );
+    let stub = common::RoutedStubServer::start(routes);
     write_models_toml(&cwd, "vendor/cached-model");
     let cache_dir = cwd.join("cache");
 
@@ -213,10 +259,14 @@ fn second_invocation_within_ttl_makes_no_network_call() {
         .expect("second run");
     assert_eq!(second.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&second.stderr));
 
+    let catalogue_requests: Vec<String> = stub
+        .requests()
+        .into_iter()
+        .filter(|r| r.contains("/models"))
+        .collect();
     assert_eq!(
-        stub.requests().len(),
+        catalogue_requests.len(),
         1,
-        "expected exactly one catalogue fetch across both runs, got {:?}",
-        stub.requests()
+        "expected exactly one catalogue fetch across both runs, got {catalogue_requests:?}"
     );
 }
