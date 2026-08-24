@@ -4,6 +4,7 @@ use codemason_core::cli::{self, ExitCode, RunArgs, API_KEY_ENV, BASE_URL_ENV};
 use codemason_core::log::{event_type, EventLog};
 use codemason_core::report::{finish, IndexReport, RunReport, TotalsReport};
 use codemason_core::partition::{self, PartitionOptions};
+use codemason_core::surface;
 use codemason_core::text::normalize_slashes;
 use codemason_core::{config, gating, llm, repo, Error, Index, LoopConfig, LoopExit};
 use uuid::Uuid;
@@ -406,6 +407,32 @@ fn index_cmd(sub: &clap::ArgMatches) -> ExitCode {
         let line = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
         if let Err(err) = codemason_core::text::write_stdout(&format!("{line}\n")) {
             eprintln!("error: could not write graph: {err}");
+            return ExitCode::UnrecoverableError;
+        }
+    }
+
+    if sub.get_flag("surface") {
+        let requested = sub.get_one::<String>("surface-path").map(|s| s.as_str());
+        let surface = surface::extract(index.graph(), repo, requested);
+
+        // A `--surface-path` that matches nothing is an operator typo, and
+        // the output it produces — an empty surface, exit 0 — is the one a
+        // supervisor would paste without noticing. Refuse it instead.
+        if surface.stats.files == 0
+            && let Some(path) = requested
+        {
+            eprintln!("error: no indexed files under {path}");
+            return ExitCode::UnrecoverableError;
+        }
+
+        let out = if sub.get_flag("json") {
+            let line = serde_json::to_string(&surface).unwrap_or_else(|_| "{}".to_string());
+            format!("{line}\n")
+        } else {
+            surface::render(&surface)
+        };
+        if let Err(err) = codemason_core::text::write_stdout(&out) {
+            eprintln!("error: could not write surface: {err}");
             return ExitCode::UnrecoverableError;
         }
     }

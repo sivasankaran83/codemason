@@ -16,13 +16,14 @@ use std::process::ExitCode as ProcExitCode;
 use std::time::Instant;
 
 use codemason_core::llm::Client;
-use codemason_core::supervisor::execute::{dispatch_level, DispatchConfig};
+use codemason_core::supervisor::execute::{dispatch_level, DispatchConfig, Execution};
 use codemason_core::supervisor::integrate::{
-    create_integration_branch, mergeable, run_acceptance, CompletedItem, Integration, NextStep,
+    create_integration_branch, evidence_lines, mergeable, run_acceptance, CompletedItem,
+    Integration, NextStep,
 };
 use codemason_core::supervisor::memory::{BriefOptions, Fact, JsonlMemory, MemoryStore};
 use codemason_core::supervisor::plan::{plan as make_plan, PlanRequest};
-use codemason_core::supervisor::{Disposition, Plan, MAX_FIX_CYCLES};
+use codemason_core::supervisor::{Disposition, Plan, WorkItem, MAX_FIX_CYCLES, MAX_REWRITES};
 use codemason_core::text::write_stdout;
 use uuid::Uuid;
 
@@ -31,6 +32,13 @@ use uuid::Uuid;
 const OK: u8 = 0;
 const FAILED: u8 = 1;
 const ESCALATED: u8 = 10;
+
+/// Diagnostic lines written into the memory when a level is rewritten.
+///
+/// Enough to name the members the discarded attempt invented, few enough that
+/// the brief's character budget still leaves room for the task itself — a
+/// task string that is mostly compiler output has crowded out the task.
+const MAX_EVIDENCE_LINES: usize = 12;
 
 fn main() -> ProcExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -234,78 +242,18 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
         eprintln!("level {level}: dispatching {} job(s)", items.len());
 
         let executions = dispatch_level(&items, &dispatch);
-        let mut completed: Vec<CompletedItem> = Vec::new();
-        let mut escalate: Option<String> = None;
-
-        for exec in &executions {
-            match &exec.result {
-                Err(err) => {
-                    // A process that would not start will not start on a
-                    // retry either. Straight to a human.
-                    memory.append(Fact::note(
-                        Some(&exec.item_id),
-                        format!("dispatch failed: {err}"),
-                    ))?;
-                    escalate.get_or_insert(format!("{} could not be dispatched: {err}", exec.item_id));
-                }
-                Ok(outcome) => {
-                    report.totals.add(outcome.totals.total_tokens, outcome.totals.cost);
-                    let cycle = memory.cycles_attempted(&exec.item_id)? + 1;
-                    memory.append(Fact::attempt(
-                        &exec.item_id,
-                        cycle,
-                        outcome.exit_code,
-                        // Not yet verified at this point; the acceptance
-                        // command is what decides, and it runs after merge.
-                        false,
-                        format!(
-                            "exit {} ({}), {} file(s) changed",
-                            outcome.exit_code,
-                            outcome.status,
-                            outcome.files_changed.len()
-                        ),
-                    ))?;
-
-                    if exec.disposition() == Some(Disposition::Escalate) {
-                        escalate.get_or_insert(format!(
-                            "{} exited {} — retrying spends money without changing anything",
-                            exec.item_id, outcome.exit_code
-                        ));
-                    }
-                    if mergeable(outcome) {
-                        let item = items
-                            .iter()
-                            .find(|i| i.id == exec.item_id)
-                            .cloned()
-                            .expect("every execution came from this level's items");
-                        completed.push(CompletedItem {
-                            item,
-                            outcome: outcome.clone(),
-                        });
-                    }
-                    report.items.push(ItemReport {
-                        id: exec.item_id.clone(),
-                        level,
-                        exit_code: outcome.exit_code,
-                        status: outcome.status.clone(),
-                        branch: outcome.branch.clone(),
-                        commit: outcome.commit.clone(),
-                        files_changed: outcome.files_changed.len(),
-                        // Model prose. Recorded, never gated on.
-                        summary: outcome.summary.clone(),
-                    });
-                }
-            }
-        }
+        let (branches, escalate) =
+            collect_level(level, &items, &executions, &mut memory, &mut report)?;
 
         if let Some(reason) = escalate {
             return finish(report, NextStep::Escalate, reason, started);
         }
 
-        let branches: Vec<String> = completed
-            .iter()
-            .filter_map(|c| c.outcome.branch.clone())
-            .collect();
+        // Where the integration branch stood before this level merged
+        // anything. A rewrite resets to this commit rather than to `base`,
+        // so discarding this level's branches leaves the levels already
+        // accepted onto the branch exactly where they are.
+        let level_base = branch_commit(&repo, &integration_branch)?;
         let mut integration = Integration::new(integration_branch.clone());
         integration.merge_level(&repo, &branches)?;
         report.merged += branches.len() - integration.conflicts.len();
@@ -352,6 +300,11 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
         eprintln!("level {level}: {} acceptance command(s) to satisfy", gates.len());
 
         let mut cycle = 0u32;
+        // Rewrites are counted apart from fix cycles because they answer
+        // different questions: a fix cycle says the work is sound but
+        // incomplete, a rewrite says it was built on a premise that does not
+        // hold. One must not consume the other's allowance.
+        let mut rewrites = 0u32;
         loop {
             // First failure decides the cycle: a level is only accepted when
             // every one of its gates passes.
@@ -384,6 +337,107 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
                 NextStep::Accept => break,
                 NextStep::Escalate => {
                     return finish(report, NextStep::Escalate, decision.reason, started)
+                }
+                NextStep::Rewrite => {
+                    rewrites += 1;
+                    // The cap is enforced inside `record_verification`; this
+                    // is the same belt-and-braces guard as the fix-cycle one
+                    // below, so a future change there cannot turn this into
+                    // an unbounded spend.
+                    if rewrites > MAX_REWRITES {
+                        return finish(
+                            report,
+                            NextStep::Escalate,
+                            format!(
+                                "level {level} was rewritten {MAX_REWRITES} time(s) and is still \
+                                 built on a wrong premise"
+                            ),
+                            started,
+                        );
+                    }
+
+                    // What the rewrite has to be told. The codes alone say a
+                    // member was not found; the lines say which member, and
+                    // that is the fact that stops the next attempt inventing
+                    // it again.
+                    let evidence = integration
+                        .verifications
+                        .last()
+                        .map(|v| {
+                            evidence_lines(
+                                &v.output,
+                                &decision.novel_error_codes,
+                                MAX_EVIDENCE_LINES,
+                            )
+                        })
+                        .unwrap_or_default();
+                    memory.append(Fact::learned(
+                        None,
+                        format!(
+                            "level {level} was discarded and written again rather than fixed: {}. \
+                             The names these diagnostics report do not exist on the real surface, \
+                             so do not call them:\n{}",
+                            decision.reason,
+                            evidence.join("\n")
+                        ),
+                    ))?;
+
+                    // A rewrite is only worth dispatching if the *input*
+                    // changed, and the only input a job has is its task
+                    // string — `dispatch_args` passes `--task` and nothing
+                    // else, and the process itself remembers nothing. So the
+                    // memory is carried into the task text here; without it
+                    // the rewrite reproduces the failure at full price.
+                    //
+                    // The original task, not a fix task. There is nothing on
+                    // those branches worth repairing, which is the whole
+                    // finding behind this branch of the decision.
+                    let rewritten: Vec<WorkItem> = items
+                        .iter()
+                        .map(|item| {
+                            let brief = memory
+                                .brief_for(&item.id, BriefOptions::default())
+                                .unwrap_or_default();
+                            let mut rewritten = item.clone();
+                            if !brief.trim().is_empty() {
+                                rewritten.task = format!(
+                                    "{}\n\nAn earlier attempt at this exact task was discarded. \
+                                     What it got wrong:\n{}",
+                                    item.task, brief
+                                );
+                            }
+                            rewritten
+                        })
+                        .collect();
+
+                    eprintln!(
+                        "level {level}: discarding {} branch(es) and dispatching the original \
+                         task(s) again",
+                        integration.merged.len()
+                    );
+
+                    let executions = dispatch_level(&rewritten, &dispatch);
+                    let (rewritten_branches, escalate) =
+                        collect_level(level, &rewritten, &executions, &mut memory, &mut report)?;
+                    if let Some(reason) = escalate {
+                        return finish(report, NextStep::Escalate, reason, started);
+                    }
+
+                    // Discarding is declining to merge, and nothing needs
+                    // reverting: every job commits to its own branch and none
+                    // of them ever touches the base, so the discarded work
+                    // exists only on branches nobody merges. The integration
+                    // branch goes back to where this level found it — which
+                    // keeps the levels already accepted onto it — and the
+                    // rewritten branches are merged onto that instead. That
+                    // is why a rewrite costs one dispatch rather than a
+                    // repair.
+                    let dropped = integration.discard_merges();
+                    report.merged -= dropped.min(report.merged);
+                    create_integration_branch(&repo, &integration_branch, &level_base)?;
+                    integration.merge_level(&repo, &rewritten_branches)?;
+                    report.merged += rewritten_branches.len() - integration.conflicts.len();
+                    continue;
                 }
                 NextStep::Redispatch => {
                     cycle += 1;
@@ -430,6 +484,91 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
     }
 
     finish(report, NextStep::Accept, "all levels accepted".to_string(), started)
+}
+
+/// Record one level's dispatches and return the branches worth merging,
+/// together with a reason to escalate if one of them produced one.
+///
+/// Lifted out of the level loop because a rewrite dispatches the same level a
+/// second time and the bookkeeping is identical either way. A second copy of
+/// it would be a second place for the report and the memory to drift apart,
+/// and the memory is the only thing a re-dispatched job learns from.
+fn collect_level(
+    level: u32,
+    items: &[WorkItem],
+    executions: &[Execution],
+    memory: &mut JsonlMemory,
+    report: &mut BuildReport,
+) -> Result<(Vec<String>, Option<String>), anyhow::Error> {
+    let mut completed: Vec<CompletedItem> = Vec::new();
+    let mut escalate: Option<String> = None;
+
+    for exec in executions {
+        match &exec.result {
+            Err(err) => {
+                // A process that would not start will not start on a
+                // retry either. Straight to a human.
+                memory.append(Fact::note(
+                    Some(&exec.item_id),
+                    format!("dispatch failed: {err}"),
+                ))?;
+                escalate.get_or_insert(format!("{} could not be dispatched: {err}", exec.item_id));
+            }
+            Ok(outcome) => {
+                report.totals.add(outcome.totals.total_tokens, outcome.totals.cost);
+                let cycle = memory.cycles_attempted(&exec.item_id)? + 1;
+                memory.append(Fact::attempt(
+                    &exec.item_id,
+                    cycle,
+                    outcome.exit_code,
+                    // Not yet verified at this point; the acceptance
+                    // command is what decides, and it runs after merge.
+                    false,
+                    format!(
+                        "exit {} ({}), {} file(s) changed",
+                        outcome.exit_code,
+                        outcome.status,
+                        outcome.files_changed.len()
+                    ),
+                ))?;
+
+                if exec.disposition() == Some(Disposition::Escalate) {
+                    escalate.get_or_insert(format!(
+                        "{} exited {} — retrying spends money without changing anything",
+                        exec.item_id, outcome.exit_code
+                    ));
+                }
+                if mergeable(outcome) {
+                    let item = items
+                        .iter()
+                        .find(|i| i.id == exec.item_id)
+                        .cloned()
+                        .expect("every execution came from this level's items");
+                    completed.push(CompletedItem {
+                        item,
+                        outcome: outcome.clone(),
+                    });
+                }
+                report.items.push(ItemReport {
+                    id: exec.item_id.clone(),
+                    level,
+                    exit_code: outcome.exit_code,
+                    status: outcome.status.clone(),
+                    branch: outcome.branch.clone(),
+                    commit: outcome.commit.clone(),
+                    files_changed: outcome.files_changed.len(),
+                    // Model prose. Recorded, never gated on.
+                    summary: outcome.summary.clone(),
+                });
+            }
+        }
+    }
+
+    let branches = completed
+        .iter()
+        .filter_map(|c| c.outcome.branch.clone())
+        .collect();
+    Ok((branches, escalate))
 }
 
 fn load_plan(
@@ -558,6 +697,26 @@ fn checkout_existing(repo: &Path, branch: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// The commit a branch points at.
+///
+/// A rewrite needs the commit the integration branch stood at before the
+/// level merged anything, so it can drop that level's branches without
+/// disturbing the levels already merged onto it. A branch name would not do:
+/// the name is about to be moved.
+fn branch_commit(repo: &Path, branch: &str) -> Result<String, anyhow::Error> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", branch])
+        .current_dir(repo)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "could not read the commit of {branch}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn current_branch(repo: &Path) -> Result<String, anyhow::Error> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -618,7 +777,10 @@ fn finish(
 ) -> Result<u8, anyhow::Error> {
     report.outcome = match step {
         NextStep::Accept => "accepted",
-        NextStep::Redispatch => "unresolved",
+        // A build never finishes on either of these: both mean another
+        // dispatch, and the loop only leaves them by accepting or escalating.
+        // They are here so the match stays exhaustive rather than guessing.
+        NextStep::Redispatch | NextStep::Rewrite => "unresolved",
         NextStep::Escalate => "escalated",
     }
     .to_string();

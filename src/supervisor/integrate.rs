@@ -24,6 +24,11 @@
 //!
 //! **Fixing is only allowed to continue while the error set is shrinking.**
 //! See [`is_converging`] — this is the part worth reading.
+//!
+//! **An error set that changes shape is rewritten, not fixed.** A shape shift
+//! is evidence that the earlier errors were masking the real problem rather
+//! than being it, so the item is not partly right: it was written against a
+//! premise that does not hold. See [`NextStep::Rewrite`].
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -33,7 +38,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use super::{Disposition, MAX_FIX_CYCLES, RunOutcome, WorkItem, disposition};
+use super::{Disposition, MAX_FIX_CYCLES, MAX_REWRITES, RunOutcome, WorkItem, disposition};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IntegrateError {
@@ -223,6 +228,40 @@ pub fn scan_errors(output: &str) -> ErrorScan {
     scan
 }
 
+/// The diagnostic lines carrying any of `codes`, deduplicated and capped at
+/// `limit`.
+///
+/// This exists for [`NextStep::Rewrite`]. A rewrite that is handed only the
+/// codes learns that *a* member was not found; handed the lines, it learns
+/// which members the discarded attempt invented, which is the one fact that
+/// stops it inventing them again. Capped because the memory brief is
+/// budgeted and a build log repeats the same diagnostic once per consuming
+/// target.
+pub fn evidence_lines(output: &str, codes: &[String], limit: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || ERROR_TALLY.is_match(trimmed) {
+            continue;
+        }
+        let upper = trimmed.to_uppercase();
+        if !codes.iter().any(|code| upper.contains(code.as_str())) {
+            continue;
+        }
+        if !seen.insert(upper) {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+        if lines.len() >= limit {
+            break;
+        }
+    }
+
+    lines
+}
+
 /// One run of the acceptance command. `passed` is the whole verdict; the rest
 /// exists so a human, and the convergence check, can see why.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -336,6 +375,29 @@ pub enum NextStep {
     Accept,
     /// Fix and verify again; a cycle has been spent.
     Redispatch,
+    /// Throw the work away and dispatch the **original** task again.
+    ///
+    /// Not a fix task — the point is that there is nothing here worth
+    /// repairing. The measured case: an item written against a contract
+    /// surface it had never been shown invented members that do not exist.
+    /// Its first errors were surface ones, a missing using directive and a
+    /// name collision; fixing those did not shrink the error set but changed
+    /// it entirely, from `32x CS0246 + 4x CS0108` to `36x CS1061 + 14x CS0117
+    /// + 4x CS1739`, because the surface errors had been masking the real
+    /// problem. Three fix cycles at roughly $0.14 got nowhere; discarding the
+    /// work and redoing it succeeded in six iterations for $0.013.
+    ///
+    /// Discarding costs nothing to undo because there is nothing to undo:
+    /// every job commits to its own branch and none of them ever touches the
+    /// base, so "discard" means declining to merge that branch. No revert, no
+    /// cleanup — which is the whole reason this is the cheap option.
+    ///
+    /// A rewrite is only worth attempting if the *input* changes, and the
+    /// input that changes is the memory: [`Decision::novel_error_codes`] and
+    /// [`evidence_lines`] give the caller the names the discarded attempt
+    /// invented, so the next dispatch is told what does not exist. Without
+    /// that the rewrite reproduces the failure at full price.
+    Rewrite,
     /// A human. Every remaining machine option costs money and changes
     /// nothing.
     Escalate,
@@ -346,6 +408,15 @@ pub struct Decision {
     pub step: NextStep,
     /// Plain prose, meant for the report and for the human it escalates to.
     pub reason: String,
+    /// Error codes present now that were absent from the previous
+    /// verification — the shape shift itself, as data rather than prose.
+    ///
+    /// Populated on [`NextStep::Rewrite`], and empty otherwise. It is here so
+    /// the caller can write what was learned into the memory the rewrite will
+    /// read: the codes say a member was not found, and pairing them with the
+    /// verification output through [`evidence_lines`] says *which* member.
+    #[serde(default)]
+    pub novel_error_codes: Vec<String>,
 }
 
 // --- the level's integration state ----------------------------------------
@@ -362,6 +433,14 @@ pub struct Integration {
     pub conflicts: Vec<Conflict>,
     pub verifications: Vec<Verification>,
     pub fix_cycles_used: u32,
+    /// Rewrites spent, capped at [`MAX_REWRITES`]. Separate from
+    /// `fix_cycles_used` because the two count different failures: a fix
+    /// cycle is work that is sound but incomplete, a rewrite is work built on
+    /// a wrong premise. Sharing one counter would let a level that is merely
+    /// slow to converge use up the rewrite it might need, and the other way
+    /// round.
+    #[serde(default)]
+    pub rewrites_used: u32,
     /// Set once, when the level stops needing a machine. `None` means it has
     /// not escalated.
     pub escalation: Option<String>,
@@ -375,6 +454,7 @@ impl Integration {
             conflicts: Vec::new(),
             verifications: Vec::new(),
             fix_cycles_used: 0,
+            rewrites_used: 0,
             escalation: None,
         }
     }
@@ -440,9 +520,13 @@ impl Integration {
     /// 1. A conflict is terminal — the partitioning was wrong, and no amount
     ///    of fixing inside a partition addresses that.
     /// 2. A pass is a pass, whatever the log said.
-    /// 3. A shape shift escalates immediately, without spending a cycle it
-    ///    has no reason to expect anything from.
-    /// 4. A shrinking error set earns another cycle, up to
+    /// 3. A shape shift is rewritten rather than fixed, up to
+    ///    [`MAX_REWRITES`] — no fix cycle is spent on it, because a cycle
+    ///    spent repairing a wrong premise repairs nothing.
+    /// 4. The same error set twice over is neither: nothing new appeared and
+    ///    nothing went away, so there is no premise to replace and no
+    ///    progress to continue. A human.
+    /// 5. A shrinking error set earns another cycle, up to
     ///    [`MAX_FIX_CYCLES`]. Then a human.
     pub fn record_verification(&mut self, verification: Verification) -> Decision {
         let previous = self.verifications.last().cloned();
@@ -462,6 +546,7 @@ impl Integration {
             return Decision {
                 step: NextStep::Accept,
                 reason: "acceptance command exited zero on the integration branch".to_string(),
+                novel_error_codes: Vec::new(),
             };
         }
 
@@ -470,24 +555,42 @@ impl Integration {
         if let Some(previous) = previous.as_ref()
             && !is_converging(previous, current)
         {
-            let novel: Vec<&str> = current
+            let novel: Vec<String> = current
                 .error_codes
                 .difference(&previous.error_codes)
-                .map(String::as_str)
+                .cloned()
                 .collect();
-            let reason = if novel.is_empty() {
-                format!(
+
+            if novel.is_empty() {
+                return self.escalate(format!(
                     "not converging: {} errors before, {} now — the same wall, hit twice",
                     previous.error_count, current.error_count
-                )
-            } else {
-                format!(
-                    "not converging: new error codes {} appeared, so the error set is \
-                     moving rather than shrinking",
-                    novel.join(", ")
-                )
+                ));
+            }
+
+            let reason = format!(
+                "error set changed shape: {} appeared where {} errors stood before, so the \
+                 earlier errors were masking the real problem rather than being it",
+                novel.join(", "),
+                previous.error_count
+            );
+
+            // A second shape shift means the rewrite was given an input that
+            // is still wrong, and only a human can say what is wrong with it.
+            if self.rewrites_used >= MAX_REWRITES {
+                return self.escalate(format!(
+                    "{reason} — already rewritten {} time(s), so the input the rewrite was \
+                     given is itself wrong",
+                    self.rewrites_used
+                ));
+            }
+
+            self.rewrites_used += 1;
+            return Decision {
+                step: NextStep::Rewrite,
+                reason,
+                novel_error_codes: novel,
             };
-            return self.escalate(reason);
         }
 
         if self.fix_cycles_used >= MAX_FIX_CYCLES {
@@ -511,7 +614,25 @@ impl Integration {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            novel_error_codes: Vec::new(),
         }
+    }
+
+    /// Forget this level's merges, returning how many were dropped.
+    ///
+    /// What a rewrite does to the tree, and it is deliberately this small.
+    /// Nothing is reverted because nothing was ever committed anywhere but
+    /// the discarded branches themselves; the caller resets the integration
+    /// branch to the commit it stood at before the level merged anything and
+    /// merges the rewritten branches onto that instead.
+    ///
+    /// The verification history is kept. It is what the next shape shift is
+    /// compared against, and it is what the report has to show.
+    pub fn discard_merges(&mut self) -> usize {
+        let dropped = self.merged.len();
+        self.merged.clear();
+        self.conflicts.clear();
+        dropped
     }
 
     fn escalate(&mut self, reason: String) -> Decision {
@@ -521,6 +642,7 @@ impl Integration {
         Decision {
             step: NextStep::Escalate,
             reason,
+            novel_error_codes: Vec::new(),
         }
     }
 }
@@ -690,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_shift_escalates_without_spending_the_remaining_cycle() {
+    fn a_shape_shift_is_rewritten_rather_than_fixed() {
         let mut integration = Integration::new("i");
         assert_eq!(
             integration.record_verification(failing(1, &["NU1015"])).step,
@@ -699,10 +821,133 @@ mod tests {
         assert_eq!(integration.fix_cycles_used, 1);
 
         let decision = integration.record_verification(failing(1, &["NU1101"]));
-        assert_eq!(decision.step, NextStep::Escalate);
+        assert_eq!(decision.step, NextStep::Rewrite);
         assert!(decision.reason.contains("NU1101"));
-        // The second cycle was never spent — that is the point of the check.
+        // The caller needs the shape shift as data, not only as prose: this
+        // is what it writes into the memory the rewrite will read.
+        assert_eq!(decision.novel_error_codes, vec!["NU1101".to_string()]);
+        // No fix cycle was spent — a cycle spent repairing a wrong premise
+        // repairs nothing — and the rewrite is counted on its own tally.
         assert_eq!(integration.fix_cycles_used, 1);
+        assert_eq!(integration.rewrites_used, 1);
+        assert!(integration.escalation.is_none());
+    }
+
+    #[test]
+    fn the_measured_masking_case_rewrites() {
+        // The session that motivated this: surface errors were fixed, the
+        // count grew and the codes changed completely, because the surface
+        // errors had been hiding calls to APIs that were never real.
+        let mut integration = Integration::new("i");
+        assert_eq!(
+            integration
+                .record_verification(failing(36, &["CS0246", "CS0108"]))
+                .step,
+            NextStep::Redispatch
+        );
+
+        let decision = integration.record_verification(failing(54, &["CS1061", "CS0117", "CS1739"]));
+        assert_eq!(decision.step, NextStep::Rewrite);
+        assert_eq!(
+            decision.novel_error_codes,
+            vec![
+                "CS0117".to_string(),
+                "CS1061".to_string(),
+                "CS1739".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shrinking_error_set_with_the_same_codes_is_still_a_fix_cycle() {
+        // Rewriting sound-but-incomplete work would throw away progress that
+        // was actually being made, so nothing here may reach for a rewrite.
+        let mut integration = Integration::new("i");
+        assert_eq!(
+            integration.record_verification(failing(30, &["CS0246"])).step,
+            NextStep::Redispatch
+        );
+        let decision = integration.record_verification(failing(11, &["CS0246"]));
+        assert_eq!(decision.step, NextStep::Redispatch);
+        assert!(decision.novel_error_codes.is_empty());
+        assert_eq!(integration.fix_cycles_used, 2);
+        assert_eq!(integration.rewrites_used, 0);
+    }
+
+    #[test]
+    fn a_second_shape_shift_escalates_because_one_rewrite_is_the_cap() {
+        let mut integration = Integration::new("i");
+        assert_eq!(
+            integration.record_verification(failing(20, &["CS0246"])).step,
+            NextStep::Redispatch
+        );
+        assert_eq!(
+            integration.record_verification(failing(36, &["CS1061"])).step,
+            NextStep::Rewrite
+        );
+
+        // The rewrite was dispatched and came back with yet another shape.
+        // The input it was given is still wrong, and that is a human's.
+        let decision = integration.record_verification(failing(14, &["CS0117"]));
+        assert_eq!(decision.step, NextStep::Escalate);
+        assert_eq!(integration.rewrites_used, MAX_REWRITES);
+        assert!(integration.escalation.is_some());
+    }
+
+    #[test]
+    fn the_same_wall_twice_escalates_rather_than_rewriting() {
+        // Nothing new appeared, so there is no premise to replace: a rewrite
+        // here would pay for the same answer a second time.
+        let mut integration = Integration::new("i");
+        assert_eq!(
+            integration.record_verification(failing(4, &["CS0246"])).step,
+            NextStep::Redispatch
+        );
+        let decision = integration.record_verification(failing(4, &["CS0246"]));
+        assert_eq!(decision.step, NextStep::Escalate);
+        assert_eq!(integration.rewrites_used, 0);
+        assert!(decision.reason.contains("the same wall"));
+    }
+
+    #[test]
+    fn discarding_merges_keeps_the_counters_and_the_history() {
+        // A rewrite drops the level's branches, not its record: the next
+        // verification is compared against the discarded attempt's, and the
+        // rewrite tally is what stops a second one.
+        let mut integration = Integration::new("i");
+        integration.merged.push("codemason/a".to_string());
+        integration.merged.push("codemason/b".to_string());
+        integration.record_verification(failing(20, &["CS0246"]));
+        integration.record_verification(failing(36, &["CS1061"]));
+
+        assert_eq!(integration.discard_merges(), 2);
+        assert!(integration.merged.is_empty());
+        assert_eq!(integration.rewrites_used, 1);
+        assert_eq!(integration.verifications.len(), 2);
+    }
+
+    #[test]
+    fn evidence_lines_name_the_members_that_do_not_exist() {
+        let output = "\
+Build started.
+Grain.cs(12,20): error CS1061: 'IClusterClient' does not contain a definition for 'GetGrainAsync'
+Grain.cs(12,20): error CS1061: 'IClusterClient' does not contain a definition for 'GetGrainAsync'
+Host.cs(31,9): error CS0117: 'SiloBuilder' does not contain a definition for 'UsePostgres'
+Other.cs(4,4): error CS0246: unrelated, and not part of the shape shift
+    3 Error(s)
+";
+        let codes = vec!["CS1061".to_string(), "CS0117".to_string()];
+        let lines = evidence_lines(output, &codes, 12);
+
+        // Repeated diagnostics collapse — MSBuild emits one per consuming
+        // target — and codes that did not shift are left out.
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("GetGrainAsync"));
+        assert!(lines[1].contains("UsePostgres"));
+        assert!(!lines.iter().any(|l| l.contains("CS0246")));
+
+        assert_eq!(evidence_lines(output, &codes, 1).len(), 1);
+        assert!(evidence_lines(output, &[], 12).is_empty());
     }
 
     #[test]

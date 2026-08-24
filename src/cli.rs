@@ -164,6 +164,25 @@ fn index_command() -> Command {
                 .value_name("F")
                 .default_value("0.10"),
         )
+        // The public contract of the repository, or of one subdirectory of
+        // it, emitted whole. A supervisor pastes this into a job's task text
+        // so the job does not spend its budget rediscovering an API it is
+        // about to call. Like `--graph`, an operator-facing flag: the tool
+        // cap in SPEC.md governs what the model is offered and is untouched
+        // by it. See `surface.rs` for why completeness is the whole point.
+        .arg(
+            Arg::new("surface")
+                .long("surface")
+                .action(ArgAction::SetTrue),
+        )
+        // One project of a monorepo, rather than all of them. Requires
+        // `--surface`: on its own it would silently do nothing.
+        .arg(
+            Arg::new("surface-path")
+                .long("surface-path")
+                .value_name("SUBPATH")
+                .requires("surface"),
+        )
         .arg(
             Arg::new("json")
                 .long("json")

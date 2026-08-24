@@ -31,6 +31,23 @@ use serde::{Deserialize, Serialize};
 /// `ORCHESTRATION.md`, "Fix cycles are capped at two".
 pub const MAX_FIX_CYCLES: u32 = 2;
 
+/// Rewrites per item before escalating to a human.
+///
+/// A rewrite discards an item's branch and dispatches the original task
+/// again, against a memory that now records what the discarded attempt got
+/// wrong. One is the cap because the only thing a rewrite changes is that
+/// input: if the second attempt is *still* built on a wrong premise, the
+/// premise the supervisor handed it is wrong, and a third dispatch would buy
+/// another wrong answer at the same price. A human has to look at the input.
+///
+/// Counted separately from [`MAX_FIX_CYCLES`] because the two answer
+/// different questions. A fix cycle says the work is sound but incomplete; a
+/// rewrite says the work was built on a premise that does not hold, and
+/// spending fix cycles on that is what the measured case did before it gave
+/// up — three failed cycles at roughly $0.14, against a rewrite that
+/// succeeded in six iterations for $0.013.
+pub const MAX_REWRITES: u32 = 1;
+
 /// One unit of work for a single `codemason` process.
 ///
 /// `task` is the entire context the job will ever have: it sees this string

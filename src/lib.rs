@@ -13,6 +13,7 @@ pub mod partition;
 pub mod report;
 pub mod supervisor;
 pub mod repo;
+pub mod surface;
 pub mod text;
 pub mod tools;
 
