@@ -43,6 +43,28 @@ role = "fallback"
 id = "openai/gpt-4o-mini"              # $0.15 in / $0.60 out
 role = "fallback"
 
+# --- supervisor planners -------------------------------------------------
+#
+# The planner and the jobs are separate choices on purpose. Every failure
+# observed in testing came from judgement -- task text that sent a job
+# exploring instead of writing, or a diagnosis that named the wrong cause --
+# never from the mechanical parts. So spend on judgement and economise on
+# execution.
+#
+# It costs less than it sounds. Planning runs once per build; the jobs run
+# once per item per cycle. A Sonnet plan is roughly the price of one job.
+
+[[model]]
+id = "anthropic/claude-sonnet-5"        # $2.00 in / $10.00 out, 1M context
+role = "planner"
+
+# For a resumed build, where the previous plan did not survive verification
+# and the new one is written against the memory of why. The hardest judgement
+# in the loop and the rarest call in the build.
+[[model]]
+id = "anthropic/claude-opus-5"          # $5.00 in / $25.00 out, 1M context
+role = "planner-hard"
+
 [gating]
 min_context_length = 32000
 require_tool_support = true

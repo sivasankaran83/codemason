@@ -63,6 +63,8 @@ USAGE:
   --acceptance <CMD>       command that proves a level worked
   --model <ID>             model for the jobs
   --planner-model <ID>     model for planning; defaults to --model
+  --planner-model-hard <ID>  planner for a resumed build, where the previous
+                           attempt already failed and the memory says why
   --models-config <PATH>   passed through to codemason
   --codemason <PATH>       the codemason binary; default: resolved from PATH
   --budget-tokens <N>      per job
@@ -70,7 +72,19 @@ USAGE:
   --max-concurrent <N>     jobs in flight at once
   --memory <PATH>          memory JSONL; default <repo>/.agent/supervisor/<id>.jsonl
   --base <BRANCH>          base to integrate onto; default: current branch
+  --resume <BUILD-ID>      continue a build: reuse its memory and integration
+                           branch, and skip levels already accepted
+  --base-url <URL>         provider endpoint; env CODEMASON_BASE_URL
+  --api-key <KEY>          provider key; env CODEMASON_API_KEY
   --dry-run                plan and print, dispatch nothing
+
+The planner and the jobs are separate model choices on purpose. Planning and
+diagnosis are where judgement lives and where every observed failure came
+from; execution is mechanical. A strong planner over cheap workers is the
+split this design is for, and planning runs once per build rather than once
+per iteration, so it is cheap in absolute terms:
+
+  --planner-model anthropic/claude-sonnet-5 --model minimax/minimax-m2.7
 
 Exit: 0 accepted, 1 error, 10 escalated to a human.";
 
@@ -103,7 +117,20 @@ fn read_optional(args: &[String], name: &str) -> Result<String, anyhow::Error> {
 
 fn run(args: &[String]) -> Result<u8, anyhow::Error> {
     let started = Instant::now();
-    let build_id = Uuid::now_v7();
+    // A resumed build keeps its identity: same memory file, same integration
+    // branch. Everything the previous attempt learned is the reason to resume
+    // rather than start again, and a new id would orphan it.
+    let resumed = match flag(args, "--resume") {
+        // An empty id is a caller bug — usually a shell variable that did not
+        // expand. Taking it would resume "build-", which is a different build
+        // from any that has ever run.
+        Some(id) if id.trim().is_empty() => {
+            anyhow::bail!("--resume was given an empty build id")
+        }
+        Some(id) => Some(id.trim().to_string()),
+        None => None,
+    };
+    let build_id = resumed.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
 
     let repo = PathBuf::from(
         flag(args, "--repo").ok_or_else(|| anyhow::anyhow!("--repo is required"))?,
@@ -118,9 +145,27 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
             .join("supervisor")
             .join(format!("{build_id}.jsonl"))
     });
+    if resumed.is_some() && !memory_path.exists() {
+        anyhow::bail!(
+            "cannot resume {build_id}: no memory at {}. Without it a resume is just              a rerun that has forgotten what the first attempt learned.",
+            memory_path.display()
+        );
+    }
     let mut memory = JsonlMemory::open(&memory_path)?;
 
-    let plan = load_plan(args, &repo, &mut memory)?;
+    // Levels an earlier attempt already got past. Recorded as an accepted
+    // attempt against a synthetic `level-N` id, so resume reads the same
+    // record the loop writes rather than a second bookkeeping file that could
+    // disagree with it.
+    let done: Vec<u32> = accepted_levels(&memory)?;
+    if !done.is_empty() {
+        eprintln!(
+            "resuming {build_id}: level(s) {} already accepted, skipping",
+            done.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    let plan = load_plan(args, &repo, &mut memory, resumed.is_some())?;
 
     eprintln!(
         "plan: {} item(s) across {} level(s)",
@@ -162,8 +207,16 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
     };
 
     let integration_branch = format!("codemason/build-{build_id}");
-    create_integration_branch(&repo, &integration_branch, &base)?;
-    eprintln!("integrating onto {integration_branch} (base {base})");
+    if resumed.is_some() && branch_exists(&repo, &integration_branch) {
+        // Reset onto the existing branch rather than recreating it from base:
+        // recreating would discard the levels already merged, which is the
+        // work resume exists to keep.
+        checkout_existing(&repo, &integration_branch)?;
+        eprintln!("resuming on {integration_branch}");
+    } else {
+        create_integration_branch(&repo, &integration_branch, &base)?;
+        eprintln!("integrating onto {integration_branch} (base {base})");
+    }
 
     let mut report = BuildReport {
         build_id: build_id.to_string(),
@@ -173,6 +226,10 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
     };
 
     for level in plan.levels() {
+        if done.contains(&level) {
+            report.levels_accepted += 1;
+            continue;
+        }
         let items: Vec<_> = plan.items_at(level).into_iter().cloned().collect();
         eprintln!("level {level}: dispatching {} job(s)", items.len());
 
@@ -253,9 +310,30 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
         integration.merge_level(&repo, &branches)?;
         report.merged += branches.len() - integration.conflicts.len();
 
-        // Verify. Without an acceptance command there is nothing to gate on,
-        // and saying so is more honest than reporting success we did not test.
-        let Some(command) = acceptance.as_deref() else {
+        // Verify. The gate runs on the integrated tree, so it is a property
+        // of the level rather than of one item; `--acceptance` overrides, and
+        // otherwise the level's own items supply it. A level whose items
+        // disagree about how to prove themselves is a planning error, and
+        // saying so beats silently picking one.
+        let mut item_gates: Vec<&str> = items
+            .iter()
+            .filter_map(|i| i.acceptance.as_deref())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        item_gates.sort_unstable();
+        item_gates.dedup();
+        if item_gates.len() > 1 && acceptance.is_none() {
+            eprintln!(
+                "level {level}: items disagree on the acceptance command ({} distinct);                  using the first. Pass --acceptance to settle it.",
+                item_gates.len()
+            );
+        }
+        let level_gate: Option<String> = acceptance
+            .clone()
+            .or_else(|| item_gates.first().map(|s| s.to_string()));
+
+        let Some(command) = level_gate.as_deref() else {
             eprintln!("level {level}: merged {} branch(es); no --acceptance, not verified", branches.len());
             memory.append(Fact::note(None, format!("level {level} merged without verification")))?;
             continue;
@@ -318,6 +396,16 @@ fn run(args: &[String]) -> Result<u8, anyhow::Error> {
                 }
             }
         }
+        // Recorded so a later resume can skip this level. `accepted` is the
+        // acceptance command's verdict, which is the only thing entitled to
+        // say a level is done.
+        memory.append(Fact::attempt(
+            &format!("level-{level}"),
+            0,
+            0,
+            true,
+            format!("level {level} accepted"),
+        ))?;
         report.levels_accepted += 1;
     }
 
@@ -328,6 +416,7 @@ fn load_plan(
     args: &[String],
     repo: &Path,
     memory: &mut JsonlMemory,
+    is_resume: bool,
 ) -> Result<Plan, anyhow::Error> {
     if let Some(path) = flag(args, "--plan") {
         let raw = std::fs::read_to_string(path)?;
@@ -357,9 +446,21 @@ fn load_plan(
     )?;
     let client = Client::new(base_url, api_key);
 
-    let model = flag(args, "--planner-model")
-        .or_else(|| flag(args, "--model"))
-        .ok_or_else(|| anyhow::anyhow!("--planner-model or --model is required to plan"))?;
+    // A resumed build is the hard case by definition: the previous plan did
+    // not survive verification, and this one is being written against the
+    // record of why. That is where a stronger planner earns its cost, and it
+    // is a rare enough call that the cost barely registers against the jobs.
+    let model = if is_resume {
+        flag(args, "--planner-model-hard")
+            .or_else(|| flag(args, "--planner-model"))
+            .or_else(|| flag(args, "--model"))
+    } else {
+        flag(args, "--planner-model").or_else(|| flag(args, "--model"))
+    }
+    .ok_or_else(|| anyhow::anyhow!("--planner-model or --model is required to plan"))?;
+    if is_resume {
+        eprintln!("replanning with {model}");
+    }
 
     // The memory is empty on a first build and full on a resumed one. Either
     // way it goes to the planner: that is what makes this a loop rather than
@@ -393,6 +494,48 @@ fn partitions_from_codemason(args: &[String], repo: &Path) -> Result<String, any
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Levels an earlier attempt accepted, read back from the memory the loop
+/// itself writes.
+fn accepted_levels(memory: &JsonlMemory) -> Result<Vec<u32>, anyhow::Error> {
+    let mut levels: Vec<u32> = memory
+        .all()?
+        .into_iter()
+        .filter(|f| f.accepted == Some(true))
+        .filter_map(|f| {
+            f.item_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("level-"))
+                .and_then(|n| n.parse::<u32>().ok())
+        })
+        .collect();
+    levels.sort_unstable();
+    levels.dedup();
+    Ok(levels)
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", branch])
+        .current_dir(repo)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn checkout_existing(repo: &Path, branch: &str) -> Result<(), anyhow::Error> {
+    let out = std::process::Command::new("git")
+        .args(["checkout", "-q", branch])
+        .current_dir(repo)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "could not check out {branch}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn current_branch(repo: &Path) -> Result<String, anyhow::Error> {
