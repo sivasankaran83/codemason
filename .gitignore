@@ -1,0 +1,5 @@
+/target
+
+# Local reference tree only — read from during development, never committed
+# or depended on by path. See PLAN.md, WP1 feasibility notes.
+old_source/

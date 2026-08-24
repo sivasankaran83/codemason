@@ -1,0 +1,64 @@
+[package]
+name = "codemason-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+
+[[bin]]
+name = "codemason"
+path = "src/bin/codemason.rs"
+
+[features]
+default = []
+# Option A (see PLAN.md): the vendored engine/mod.rs unconditionally declares
+# `pub mod encoder;`, and encoder.rs unconditionally imports model2vec-rs and
+# ndarray with no cfg gate in the supplied source. Gating those crates out of
+# the default build would require editing engine/index/{mod,create}.rs and
+# engine/mod.rs, which the do-not-refactor rule forbids. So model2vec-rs and
+# ndarray are always-present, always-compiled dependencies; this feature only
+# gates whether codemason_core::Index::find_related is exposed as a working
+# call (embeddings) or a clean "feature disabled" error (default) — the model
+# itself is never loaded and no embedding ever runs unless a caller asks for
+# find_related under this feature.
+embeddings = []
+
+[dependencies]
+anyhow = "=1.0.104"
+chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+regex = "=1.13.1"
+dirs = "=6.0.0"
+ignore = "=0.4.33"
+log = "=0.4.33"
+once_cell = "=1.21.4"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.19"
+tree-sitter = "=0.25.10"
+tree-sitter-c = "=0.23.4"
+tree-sitter-c-sharp = "=0.23.5"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-css = "=0.25.0"
+tree-sitter-go = "=0.23.4"
+tree-sitter-html = "=0.23.2"
+tree-sitter-java = "=0.23.5"
+tree-sitter-javascript = "=0.23.1"
+tree-sitter-kotlin-ng = "=1.1.0"
+tree-sitter-php = "=0.23.11"
+tree-sitter-python = "=0.23.6"
+tree-sitter-ruby = "=0.23.1"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-swift = "=0.7.3"
+tree-sitter-typescript = "=0.23.2"
+model2vec-rs = "=0.2.1"
+ndarray = "=0.15.6"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
