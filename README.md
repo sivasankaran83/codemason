@@ -36,11 +36,14 @@ finishing. Good retrieval is what makes cheap execution viable.
 
 ## Status
 
-Milestone 1, work packages 1 through 4 complete (engine harvest, CLI/config/
-gating, the read-only agent loop, and writes/commands/git/budget). WP5
-(measurement, containerisation, acceptance suite) remains. See `SPEC.md` for
-scope, work packages and acceptance criteria, and `CLAUDE.md` for how work
-proceeds in this repository.
+Milestone 1, work packages 1 through 5 complete (engine harvest, CLI/config/
+gating, the read-only agent loop, writes/commands/git/budget, and the closing
+measurement/containerisation/acceptance package). The container in this repo
+is written to spec but has not been built or run — this development machine
+has neither Docker nor a WSL Linux distribution installed, so that one piece
+is unverified; see [Container](#container) below. See `SPEC.md` for scope,
+work packages and acceptance criteria, and `CLAUDE.md` for how work proceeds
+in this repository.
 
 ## Exit codes
 
@@ -67,3 +70,47 @@ you care about outside a sandbox.
 `src/engine/` is vendored third-party source, copied verbatim. See `ORIGIN.md`
 beside it and `LICENSE-ENGINE` at the repository root. It is not refactored,
 reformatted or otherwise modified — see `CLAUDE.md`.
+
+## Index cost measurement
+
+Per SPEC.md's WP5/T5.1: `codemason index --stats` measured against three real
+repositories of increasing size, including the largest available on the
+development machine. "Cold" means the first read of that repository's files
+in the measuring process (not a dropped OS file cache, which needs elevated
+tooling not available here — the numbers below understate a truly cold read
+on a machine that has never touched these files before). "Warm" is an
+immediate second run against the same repository.
+
+| repository | indexed files | chunks | cold | warm |
+|---|---|---|---|---|
+| `buildsmith` (C#) | 18 | 95 | 329 ms | 53 ms |
+| `CapaFabric` (Go + C#) | 66 | 121 | 1,198 ms | 126 ms |
+| `CodeFabric` (Go, Rust, TypeScript, SQL — largest available) | 214 | 879 | 4,503 ms | 1,348 ms |
+
+**Decision: build in-memory per run, do nothing further.** Even the largest
+repository available for measurement builds in 4.5 s cold, comfortably inside
+T5.1's "under ~5 s" threshold. Index persistence (a versioned on-disk format,
+`--out`/`--index` flags) is not worth building for M1 — revisit only if a
+repository an order of magnitude larger than `CodeFabric` becomes the norm, or
+if parallel job counts make repeated cold builds visible in practice.
+
+## Container
+
+Multi-stage build: a slim Rust builder compiles the release binary, then a
+`debian:bookworm-slim` runtime carries only `git`, CA certificates and the
+binary — `git` is required because the runner shells out to it rather than
+linking a git library; no model weights ever enter the image, since retrieval
+is BM25 + AST only.
+
+```
+docker build -t codemason .
+docker run --rm -v /path/to/target/repo:/repo codemason \
+  run --repo /repo --task "..." --model <id> --base-url <url> --api-key <key>
+```
+
+**Not verified in this environment.** This development machine has neither
+Docker nor a registered WSL Linux distribution, so `docker build`/`docker run`
+and the resulting image size could not be exercised here. The `Dockerfile` is
+written to match the spec's shape and reviewed by inspection, but its build
+and run success is unconfirmed — verify on a Docker-capable machine before
+relying on it.

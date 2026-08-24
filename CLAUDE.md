@@ -20,6 +20,15 @@ Work is organised into five work packages, WP1 through WP5. **One work package
 per session.** Do not begin a package in a session that has already completed
 one — restate the scope in a fresh session instead.
 
+**Status: WP1 through WP5 have all reached their package gate.** M1 is not
+therefore automatically complete — SPEC.md's separate "Milestone Validation"
+section (ten real runs across at least two repositories and three model
+vendors, four concurrent processes, reconciled token totals) is the
+remaining bar, and it is operational validation, not a sixth work package.
+WP5's container was written to spec but is unverified — no Docker or WSL on
+the primary dev machine — and should be built and run on a Docker-capable
+machine before anything depends on it.
+
 Within a package, run these stages in order:
 
 1. **Kickoff** — read the package section and its acceptance criteria. Restate
@@ -71,7 +80,14 @@ Enforced by acceptance criteria — check before proposing a dependency.
   parallelism is process-per-job.
 - `rustls` only. `openssl-sys` must not enter the tree.
 - Shell out to the `git` CLI. Do not link a git library.
-- No embedding or n-dimensional array crates in the default build.
+- No embedding or n-dimensional array crates in the default build. **Known,
+  accepted deviation:** `model2vec-rs`/`ndarray` are unconditional
+  dependencies today because the vendored `engine/mod.rs` declares its
+  encoder module with no `cfg` gate, and adding one would violate "do not
+  refactor `src/engine/`" below. Embedding *functionality* (not crate
+  presence) is what's actually gated. Do not "fix" this by editing
+  `engine/`; see `tests/wp1_engine.rs` and WP5's `PLAN.md` for the reasoning,
+  which was reviewed and accepted, not overlooked.
 - Exact version pins (`=x.y.z`). The tree-sitter core and grammar pins are a
   known-good set copied wholesale — do not resolve fresh ones, as grammar crates
   pin incompatible core versions.
