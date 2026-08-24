@@ -12,6 +12,15 @@ unsafe_code = "deny"
 name = "codemason"
 path = "src/bin/codemason.rs"
 
+# The supervisor is a separate process, not a codemason subcommand. The design
+# rests on codemason knowing nothing about orchestration, and a worker that
+# orchestrates itself cannot be composed. Same crate so the two share the
+# report contract and the provider plumbing; separate binary so the boundary
+# is a process boundary.
+[[bin]]
+name = "codemason-supervisor"
+path = "src/bin/codemason-supervisor.rs"
+
 [features]
 default = []
 # Option A (see PLAN.md): the vendored engine/mod.rs unconditionally declares
