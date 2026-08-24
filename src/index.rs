@@ -19,9 +19,24 @@ pub struct Index {
 }
 
 impl Index {
+    /// Build the index over `repo_root`, including documentation files.
+    ///
+    /// Equivalent to `build_with(repo_root, true)`. Documents are included by
+    /// default because a repository's specifications, ADRs and architecture
+    /// notes are frequently the only statement of intent that exists — most
+    /// obviously on a spec-driven or greenfield repository, where markdown is
+    /// the entire input and there is not yet any code to search. An agent that
+    /// cannot find them cannot follow them.
     pub fn build(repo_root: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::build_with(repo_root, true)
+    }
+
+    /// `include_docs: false` restricts the index to source code, which is
+    /// what the engine does by default. Worth having for a large repository
+    /// whose documentation is voluminous and irrelevant to the task.
+    pub fn build_with(repo_root: impl AsRef<Path>, include_docs: bool) -> Result<Self, Error> {
         let started = Instant::now();
-        let inner = engine::SembleIndex::from_path(repo_root, None, None, None, false)
+        let inner = engine::SembleIndex::from_path(repo_root, None, None, None, include_docs)
             .map_err(Error::IndexBuild)?;
         let build_ms = started.elapsed().as_millis();
 

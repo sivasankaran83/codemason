@@ -26,6 +26,69 @@ running sequentially is the correct answer, not a fallback.
 Follow `ORCHESTRATION.md`: **Analyze → Partition → Plan → Execute → Integrate
 → Report.** Never skip Partition and never guess at it.
 
+### 0. Which kind of repository is this?
+
+Check before anything else, because it decides where partitions come from:
+
+```bash
+codemason index --repo <PATH> --partition
+```
+
+- **`NO DEPENDENCY GRAPH`** — a greenfield or skeleton repository: specs and
+  scaffolding, little or no source yet. Skip to *Greenfield* below. Do not
+  conclude the work cannot be parallelised; there is simply no code to analyse
+  yet.
+- **`DEGRADES TO SEQUENTIAL`** — real code, one cohesive cluster. Dispatch a
+  single job. Say so plainly.
+- **Several partitions** — an existing codebase. Continue with stages 1-2.
+
+### Greenfield: partition from the architecture, not from code
+
+When there is no code yet, the dependency graph is empty and the partitioner
+has nothing to work with. **The architecture document is the partition.** A
+specification that lists projects and states their dependencies is a
+hand-authored dependency DAG, and it is more reliable than anything inferred
+from an empty tree.
+
+Read the repository's own structure and architecture docs, then derive levels
+from the stated dependencies. For example, a spec saying *"Abstractions: no
+dependencies, contracts only"* and *"Core: no framework coupling"* gives:
+
+```
+level 1  Abstractions          (nothing depends on it yet)
+level 2  Core                  (depends on Abstractions)
+level 3  Reasoning, Ontology, Context     -- concurrent
+level 4  Grains
+level 5  Silo, Gateway, Ingestion         -- concurrent
+```
+
+Two greenfield-specific rules:
+
+- **Contracts first, always.** The level that defines interfaces must complete
+  before anything implementing them starts. A job cannot see its sibling's
+  output, so an interface invented in parallel by two jobs will not match.
+- **Paste the contract into the task text.** Once level 1 exists, later jobs
+  need those signatures written out verbatim in their `--task` text. They
+  cannot `context_search` for a file another job just wrote in a different
+  worktree.
+
+After the first level lands, the repository has code, and stages 1-2 apply
+normally from then on. Re-run `--partition` between levels.
+
+### Respect the target repository's own rules
+
+Many repositories carry instructions for coding agents — `AI_GUIDELINES.md`,
+`CONTRIBUTING.md`, `CLAUDE.md`, `AGENTS.md`, a constitution or conventions
+file. **codemason does not read these on its own**, and its index does not
+chunk markdown, so `context_search` will not surface them either.
+
+Every `--task` text must therefore instruct the job to read them first:
+
+> Before writing any code, read AI_GUIDELINES.md and .harness/conventions.md
+> in full and follow them exactly.
+
+Skipping this produces code that is correct and unmergeable.
+
 ### 1-2. Analyze and partition
 
 ```bash

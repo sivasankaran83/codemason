@@ -82,6 +82,42 @@ constrained by it. Nothing in `src/engine/` is modified.
 
 ---
 
+### Greenfield repositories have no graph
+
+A skeleton — specifications, ADRs, scaffolding, no source yet — produces an
+empty dependency graph, and `--partition` reports
+`sequential_reason: "empty"`. That is not "too coupled to split"; it is
+"nothing to analyse yet", and the two call for opposite responses.
+
+**On a greenfield repository the architecture document is the partition.** A
+specification that lists projects and states their dependencies is a
+hand-authored dependency DAG, and a better one than anything inferrable from an
+empty tree. Derive levels from the stated dependencies, run the first level to
+create the contracts, then re-run `--partition` — from the second level onward
+there is code, and stages 1-2 apply normally.
+
+Two rules bind harder here than anywhere else. Contracts must complete before
+implementations start, because two jobs inventing the same interface in
+parallel will not agree and nothing catches it until integration. And once
+contracts exist, their signatures must be pasted verbatim into later task text:
+a job cannot search for a file another job wrote in a separate worktree.
+
+### Documentation is indexed
+
+The index includes markdown, YAML, TOML and JSON alongside source, because a
+repository's specifications are frequently the only statement of intent that
+exists — and on a spec-driven repository they are the entire input. HTML is
+indexed as source and always was.
+
+Measured cost: on a code-heavy repository this is roughly +15% files, +35%
+chunks and +50% index time, which stays well inside the threshold recorded in
+the README. `Index::build_with(path, false)` restores code-only indexing.
+
+Note that indexing a document is not the same as the agent obeying it. A
+target repository's own agent rules (`AI_GUIDELINES.md`, `CONTRIBUTING.md`, a
+conventions file) are searchable but not automatically loaded, so the task text
+must tell the job to read them.
+
 ## 2. PARTITION
 
 **In:** the dependency graph. **Out:** disjoint groups of files that can be

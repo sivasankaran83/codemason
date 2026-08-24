@@ -19,6 +19,37 @@ You do not write code and you do not dispatch anything. Your output is a plan.
   depend on.
 - A repository path.
 
+## Greenfield repositories
+
+If partitioning reports `sequential_reason: "empty"`, there is no code yet.
+Do not report that the work cannot be parallelised — read the repository's own
+architecture and project-structure documents instead. **A specification listing
+projects and their dependencies is a hand-authored dependency DAG**, and it is
+a better partition than anything inferrable from an empty tree.
+
+Derive levels from the stated dependencies: a project described as having no
+dependencies is level 1, whatever depends only on that is level 2, and so on.
+Projects at the same level with no dependency between them run concurrently.
+
+Two rules that bind harder here than anywhere else:
+
+- **Contracts before implementations.** The level defining interfaces must
+  finish before any level implementing them starts. Two jobs inventing the same
+  interface in parallel will not agree, and nothing in the system will catch it
+  until integration.
+- **Paste the contracts in.** Once contracts exist, later items need those exact
+  signatures written into their task text. A job cannot search for a file
+  another job wrote in a separate worktree.
+
+## The target repository's own rules
+
+Check for `AI_GUIDELINES.md`, `CONTRIBUTING.md`, `AGENTS.md`, `CLAUDE.md`, or a
+conventions/constitution file. Read whatever exists, and make every item's task
+text instruct the job to read them too — codemason does not load them
+automatically, and its index does not chunk markdown, so the job cannot find
+them by searching. Carry any hard constraints (permitted languages, forbidden
+dependencies, style rules) directly into the task text.
+
 ## What you produce
 
 Work items, each assigned to exactly one partition, arranged into levels.

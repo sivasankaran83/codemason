@@ -72,10 +72,16 @@ pub struct PartitionStats {
     /// How many jobs can actually run at once — the only number that decides
     /// whether parallelising is worth anything.
     pub usable_parallelism: usize,
-    /// True when the repository is too densely coupled to split. A correct
-    /// outcome, not a failure: naive parallelism on coupled code measures
-    /// worse than running sequentially.
+    /// True when the repository cannot usefully be split. A correct outcome,
+    /// not a failure: naive parallelism on coupled code measures worse than
+    /// running sequentially.
     pub degrades_to_sequential: bool,
+    /// Why, when it does. `"coupled"` — one cohesive cluster. `"empty"` —
+    /// the dependency graph has no nodes at all, which is a different
+    /// situation entirely and usually means the languages present are ones
+    /// the engine does not build a graph for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequential_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +112,7 @@ pub fn partition(graph: &DependencyGraph, opts: PartitionOptions) -> PartitionRe
                 largest_partition: 0,
                 usable_parallelism: 0,
                 degrades_to_sequential: true,
+                sequential_reason: Some("empty"),
             },
         };
     }
@@ -220,6 +227,13 @@ pub fn partition(graph: &DependencyGraph, opts: PartitionOptions) -> PartitionRe
             largest_partition,
             usable_parallelism: component_partitions,
             degrades_to_sequential: component_partitions <= 1,
+            sequential_reason: if component_partitions == 0 {
+                Some("empty")
+            } else if component_partitions == 1 {
+                Some("coupled")
+            } else {
+                None
+            },
         },
         hubs: hubs_ranked.into_iter().map(|h| normalize_slashes(&h)).collect(),
         partitions,

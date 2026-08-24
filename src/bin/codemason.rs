@@ -433,10 +433,18 @@ fn index_cmd(sub: &clap::ArgMatches) -> ExitCode {
             );
             println!();
             if s.degrades_to_sequential {
-                println!("DEGRADES TO SEQUENTIAL: too densely coupled to split usefully.");
-                println!("Run it as a single job. Per ORCHESTRATION.md this is a correct");
-                println!("outcome, not a failure -- naive parallelism on coupled code");
-                println!("measures worse than not parallelising at all.");
+                if s.sequential_reason == Some("empty") {
+                    println!("NO DEPENDENCY GRAPH: nothing here to partition.");
+                    println!("The engine found no files it builds a graph for. Usually this");
+                    println!("means the repository is documentation, configuration or shell");
+                    println!("scripts rather than source in a language it parses -- not that");
+                    println!("the code is coupled. Orchestration does not apply here.");
+                } else {
+                    println!("DEGRADES TO SEQUENTIAL: too densely coupled to split usefully.");
+                    println!("Run it as a single job. Per ORCHESTRATION.md this is a correct");
+                    println!("outcome, not a failure -- naive parallelism on coupled code");
+                    println!("measures worse than not parallelising at all.");
+                }
                 println!();
             }
             for p in &result.partitions {
