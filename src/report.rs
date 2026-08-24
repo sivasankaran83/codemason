@@ -29,6 +29,17 @@ pub struct RunReport {
     pub run_id: String,
     pub status: &'static str,
     pub exit_code: i32,
+    /// The model's own account of what it did — the terminating assistant
+    /// message, which is the loop's definition of "finished". Present only
+    /// on a completed run: a run that breached a budget or ceiling never
+    /// produced one, and inventing a summary for it would be reporting work
+    /// nobody described. `null` there is the honest value.
+    ///
+    /// This is prose from a model and must be treated as such by anything
+    /// reading it: useful for a human deciding whether to look closer, and
+    /// for a supervisor to log, but never evidence that the work is correct.
+    /// `files_changed` and `commit` are the facts; this is the claim.
+    pub summary: Option<String>,
     pub branch: Option<String>,
     pub commit: Option<String>,
     pub files_changed: Vec<String>,
@@ -49,6 +60,7 @@ impl RunReport {
             run_id: run_id.to_string(),
             status: "unrecoverable_error",
             exit_code: ExitCode::UnrecoverableError.into(),
+            summary: None,
             branch: None,
             commit: None,
             files_changed: Vec::new(),

@@ -76,6 +76,14 @@ fn run_command() -> Command {
                 .long("dry-run")
                 .action(ArgAction::SetTrue),
         )
+        // Isolation for concurrent runs that share one clone — the monorepo
+        // case. Off by default: a single run against its own clone gains
+        // nothing from it and pays for a checkout it does not need.
+        .arg(
+            Arg::new("worktree")
+                .long("worktree")
+                .action(ArgAction::SetTrue),
+        )
         .arg(
             Arg::new("allow-unlisted-model")
                 .long("allow-unlisted-model")
@@ -140,6 +148,7 @@ pub struct RunArgs {
     pub branch: Option<String>,
     pub log: Option<PathBuf>,
     pub dry_run: bool,
+    pub worktree: bool,
     pub allow_unlisted_model: bool,
     pub verbose: bool,
 }
@@ -175,6 +184,7 @@ impl RunArgs {
             branch: matches.get_one::<String>("branch").cloned(),
             log: matches.get_one::<String>("log").map(PathBuf::from),
             dry_run: matches.get_flag("dry-run"),
+            worktree: matches.get_flag("worktree"),
             allow_unlisted_model: matches.get_flag("allow-unlisted-model"),
             verbose: matches.get_flag("verbose"),
         })

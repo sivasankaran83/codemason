@@ -637,6 +637,53 @@ prevent. If measurement shows weaker models reaching for `web_search` when
 they should be searching the repository, the correct response is to remove it
 again, not to add an eighth tool to compensate.
 
+## Amendment: worktree isolation and the run summary
+
+**Status:** accepted after M1, alongside the seventh tool. Two changes, both
+additive to the contract rather than altering it.
+
+### `--worktree`
+
+Two concurrent runs against **separate clones** were always safe and are
+covered by AC4. Two concurrent runs against **one clone** are not, and the
+failure is worse than a crash: `checkout -b` moves the single shared HEAD,
+`add -A` stages the other run's in-flight edits, the losing run dies on a ref
+lock, and the surviving run **reports a branch that does not hold its
+commit**. A supervisor dispatching on that JSON acts on false information,
+which is the one failure the narrow stdout contract cannot defend against.
+
+`--worktree` gives each run its own working tree, HEAD and index over one
+shared object store. Measured cost is ~0.2 s to create and ~0.2 s to remove;
+the branch outlives the tree and is what gets merged. Off by default — a run
+against its own clone gains nothing and pays for a checkout it does not need.
+
+Two properties worth stating because they are load-bearing:
+
+- `--repo` may name a repository root **or any subdirectory of one**. A
+  subdirectory is resolved to the same relative section inside the worktree,
+  so one service of a monorepo can be worked on with the index, the tools and
+  the commit all scoped to that section. This is not monorepo-specific: two
+  unrelated tasks against one ordinary repository isolate identically, which
+  removes the need to keep N clones of a large repository.
+- The event log stays anchored to the **original** repository path, never the
+  worktree. A log deleted along with the tree that produced it would take the
+  run's only diagnostic record with it.
+
+### `summary` in the stdout report
+
+The loop already terminates on an assistant message with no tool calls, and
+that message *is* the summary — but it only ever reached stderr. It is now
+also a `summary` field in the stdout JSON, so a supervisor reading the
+documented contract does not have to scrape stderr to learn what the run says
+it did. `null` on any run that did not complete: a budget or ceiling breach
+never produced a summary, and manufacturing one would report work nobody
+described.
+
+It is prose from a model and carries a model's authority, which is to say
+none. `files_changed` and `commit` are what happened; `summary` is what the
+model claims happened. Anything automated should treat it as a log line, not
+as evidence.
+
 ## Milestone Validation
 
 M1 is complete when:

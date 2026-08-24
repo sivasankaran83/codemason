@@ -45,6 +45,37 @@ is unverified; see [Container](#container) below. See `SPEC.md` for scope,
 work packages and acceptance criteria, and `CLAUDE.md` for how work proceeds
 in this repository.
 
+## Running jobs in parallel
+
+One process handles one job. How you isolate those processes depends on
+whether they share a clone:
+
+| jobs | isolation | flag |
+|---|---|---|
+| separate clones | already independent | none needed |
+| same clone, whole repo | worktree per run | `--worktree` |
+| same clone, different sections of a monorepo | worktree per run | `--worktree` |
+
+**Without `--worktree`, two runs must not share a clone.** They share one
+HEAD and one index, so they will stage each other's in-flight edits, one will
+die on a ref lock, and — worst — the survivor can report a branch that does
+not hold its commit. That last part matters because anything automated is
+reading that JSON.
+
+```
+codemason run --repo /mono/services/orders --worktree --task "..."
+```
+
+`--repo` accepts a repository root or any subdirectory of one. Point it at a
+subdirectory and the index, the tools and the commit are all scoped to that
+section — the agent sees the service it is working on, not the whole
+monorepo, which keeps context small enough for a cheap model to be effective.
+
+Each run creates its worktree (~0.2 s, shared object store), works, commits to
+its own branch, and removes the tree. The branch stays behind; merging it is
+the caller's job. Event logs are written under the original repository, not
+the worktree, so they survive teardown.
+
 ## Web search
 
 `web_search` is the seventh tool, added by a recorded amendment to `SPEC.md`
@@ -66,6 +97,31 @@ With no provider configured it falls back to a keyless DuckDuckGo endpoint.
 That fallback is **best-effort and will fail intermittently** — the endpoint
 rate-limits and answers with an HTTP 202 challenge page rather than results.
 Configure a provider for anything that matters.
+
+## The stdout report
+
+Exactly one JSON object, on every exit path; diagnostics go to stderr. This
+plus the exit code is the whole interface.
+
+```json
+{
+  "run_id": "…", "status": "completed", "exit_code": 0,
+  "summary": "Added a Discount property to the Line class in src/Order.cs.",
+  "branch": "codemason/…", "commit": "…", "files_changed": ["src/Order.cs"],
+  "iterations": 5, "index": {"chunk_count": 4, "build_ms": 8},
+  "models_used": ["…"],
+  "totals": {"prompt_tokens": 620, "completion_tokens": 165,
+             "total_tokens": 785, "cost": 0.0},
+  "duration_ms": 462, "log_path": "…"
+}
+```
+
+`summary` is the model's own account of what it did — the message it ended on
+— and is `null` on any run that did not complete. Useful for a human deciding
+whether to look closer, and worth logging. It is not evidence: `files_changed`
+and `commit` are what happened, `summary` is what the model says happened.
+
+`totals.cost` comes from the provider or is zero. Nothing is estimated.
 
 ## Exit codes
 

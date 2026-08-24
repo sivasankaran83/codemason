@@ -1,14 +1,31 @@
 //! Every repository operation this binary performs against the *target*
 //! repository shells out to the `git` CLI — never a git library — so this is
-//! the one place that would need to change to substitute worktree isolation
-//! later without touching the loop.
+//! the one place that changes when repository isolation changes. Worktree
+//! isolation was the substitution this module was shaped for, and it lives
+//! here: the loop and the stdout contract are untouched by it.
 //!
 //! `.agent/` (this tool's own log directory, already excluded from
 //! `list_files`) is excluded from both the preflight clean-check and the
 //! postflight `git add` via pathspec magic, so a prior run's leftover log
 //! never blocks the next run and is never swept into a commit.
+//!
+//! ## Why worktree isolation exists
+//!
+//! Two concurrent runs against *separate clones* are safe and always were.
+//! Two concurrent runs against *the same clone* — the natural way to work on
+//! two sections of one monorepo — are not, and fail in three ways at once,
+//! all of them from git state that is per-repository rather than per-run:
+//! `checkout -b` moves the one shared HEAD, `add -A` stages the other run's
+//! in-flight edits, and the losing run dies on a ref lock. Worse than any of
+//! those, the surviving run reports a branch that does not hold its commit —
+//! the stdout contract goes from narrow to wrong, which is the one thing a
+//! supervisor above it cannot defend against.
+//!
+//! A worktree gives each run its own HEAD, its own index and its own working
+//! directory while sharing one object store, which removes the shared state
+//! rather than trying to schedule around it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::Error;
@@ -16,6 +33,20 @@ use crate::error::Error;
 pub struct CommitInfo {
     pub sha: String,
     pub files_changed: Vec<String>,
+}
+
+/// An isolated working tree created for one run, plus where the run should
+/// actually operate inside it.
+pub struct Worktree {
+    /// Root of the isolated working tree — what `git worktree remove` takes.
+    pub root: PathBuf,
+    /// The path the run works against. Equal to `root` when `--repo` pointed
+    /// at a repository root, or `root` joined with the section subpath when
+    /// `--repo` pointed at a subdirectory of a monorepo.
+    pub work_path: PathBuf,
+    /// Top level of the original repository — every `git worktree` command
+    /// has to run from there, not from inside the worktree.
+    origin_top: PathBuf,
 }
 
 const EXCLUDE_AGENT: &str = ":!.agent";
@@ -77,9 +108,81 @@ pub fn preflight(repo_root: &Path, dry_run: bool) -> Result<(), Error> {
     Ok(())
 }
 
-/// Create and check out a new branch. Never called under `--dry-run`.
+/// Create and check out a new branch. Never called under `--dry-run`, and
+/// never called at all when the run is worktree-isolated — `worktree_add`
+/// creates the branch as part of creating the tree.
 pub fn create_branch(repo_root: &Path, name: &str) -> Result<(), Error> {
     run_git(repo_root, &["checkout", "-b", name]).map(|_| ())
+}
+
+/// Top level of the repository containing `path`, canonicalised.
+fn toplevel(path: &Path) -> Result<PathBuf, Error> {
+    let raw = run_git(path, &["rev-parse", "--show-toplevel"])?;
+    std::fs::canonicalize(&raw).map_err(|source| Error::GitCommand {
+        args: format!("rev-parse --show-toplevel ({raw})"),
+        source: source.into(),
+    })
+}
+
+/// Create an isolated worktree for one run, on a new branch, checked out at
+/// the current `HEAD` of the repository containing `repo_path`.
+///
+/// `repo_path` may be a repository root or any subdirectory of one. When it
+/// is a subdirectory — one service of a monorepo — the same relative section
+/// is resolved inside the worktree and returned as `work_path`, so the run
+/// sees exactly the section it was pointed at and nothing above it.
+///
+/// The branch outlives the worktree: removing the tree leaves the commits
+/// reachable from the branch, which is what the supervisor above merges.
+pub fn worktree_add(repo_path: &Path, branch: &str, at: &Path) -> Result<Worktree, Error> {
+    let origin_top = toplevel(repo_path)?;
+    let abs_repo = std::fs::canonicalize(repo_path).map_err(|source| Error::GitCommand {
+        args: format!("canonicalize {}", repo_path.display()),
+        source: source.into(),
+    })?;
+
+    // Empty when --repo already pointed at the repository root.
+    let section = abs_repo.strip_prefix(&origin_top).unwrap_or(Path::new(""));
+
+    let at_str = at.to_string_lossy().into_owned();
+    run_git(
+        &origin_top,
+        &["worktree", "add", "-b", branch, &at_str, "HEAD"],
+    )?;
+
+    // `git worktree add` created it, so it exists and canonicalises.
+    let root = std::fs::canonicalize(at).map_err(|source| Error::GitCommand {
+        args: format!("canonicalize {}", at.display()),
+        source: source.into(),
+    })?;
+    let work_path = if section.as_os_str().is_empty() {
+        root.clone()
+    } else {
+        root.join(section)
+    };
+
+    Ok(Worktree {
+        root,
+        work_path,
+        origin_top,
+    })
+}
+
+/// Remove an isolated worktree, leaving its branch behind.
+///
+/// `--force` because the run is expected to leave untracked files in the
+/// tree (its own `.agent/` directory at minimum), and a worktree that
+/// refuses to be removed would leak a directory per run.
+pub fn worktree_remove(worktree: &Worktree) -> Result<(), Error> {
+    let root = worktree.root.to_string_lossy().into_owned();
+    run_git(
+        &worktree.origin_top,
+        &["worktree", "remove", "--force", &root],
+    )?;
+    // Best-effort: drop any administrative leftovers so a later `worktree
+    // list` stays honest. Never fatal — the tree itself is already gone.
+    let _ = run_git(&worktree.origin_top, &["worktree", "prune"]);
+    Ok(())
 }
 
 /// Stage everything except `.agent/`, and commit only if that leaves

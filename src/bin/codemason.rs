@@ -118,7 +118,44 @@ fn run_cmd(sub: &clap::ArgMatches) -> ExitCode {
         }),
     );
 
-    let index = match Index::build(&args.repo) {
+    // Everything from here operates on `work_repo`, which is `args.repo`
+    // unless the run is worktree-isolated, in which case it is the same
+    // section resolved inside a private checkout. `args.repo` is still what
+    // the event log above is anchored to — that is deliberate, and it is
+    // what keeps the log readable after the worktree is torn down.
+    //
+    // The worktree has to exist before the index is built: the index records
+    // file paths, and the tools resolve paths against the loop's repo root.
+    // Building from one root and resolving against another would put those
+    // two out of step.
+    let mut work_repo = args.repo.clone();
+    let mut worktree: Option<repo::Worktree> = None;
+    let branch = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| format!("codemason/{run_id}"));
+
+    if !args.dry_run {
+        if args.worktree {
+            let at = std::env::temp_dir().join(format!("codemason-wt-{run_id}"));
+            match repo::worktree_add(&args.repo, &branch, &at) {
+                Ok(wt) => {
+                    work_repo = wt.work_path.clone();
+                    worktree = Some(wt);
+                }
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return finish(report, ExitCode::UnrecoverableError, start);
+                }
+            }
+        } else if let Err(err) = repo::create_branch(&args.repo, &branch) {
+            eprintln!("error: {err}");
+            return finish(report, ExitCode::UnrecoverableError, start);
+        }
+        report.branch = Some(branch.clone());
+    }
+
+    let index = match Index::build(&work_repo) {
         Ok(index) => index,
         Err(Error::IndexBuild(err)) => {
             eprintln!("error: failed to build index: {err}");
@@ -142,21 +179,9 @@ fn run_cmd(sub: &clap::ArgMatches) -> ExitCode {
         build_ms: index.stats().build_ms,
     });
 
-    if !args.dry_run {
-        let branch = args
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("codemason/{run_id}"));
-        if let Err(err) = repo::create_branch(&args.repo, &branch) {
-            eprintln!("error: {err}");
-            return finish(report, ExitCode::UnrecoverableError, start);
-        }
-        report.branch = Some(branch);
-    }
-
     let client = llm::Client::new(base_url, api_key);
     let loop_cfg = LoopConfig {
-        repo_root: args.repo.clone(),
+        repo_root: work_repo.clone(),
         task: args.task.clone(),
         model: model_id.clone(),
         max_iterations: args.max_iterations,
@@ -177,7 +202,21 @@ fn run_cmd(sub: &clap::ArgMatches) -> ExitCode {
 
     if !args.dry_run {
         let commit_message = commit_message_for(&args.task);
-        match repo::commit_all(&args.repo, &commit_message) {
+        let committed = repo::commit_all(&work_repo, &commit_message);
+
+        // Tear the worktree down whether or not the commit succeeded — the
+        // commit lives on the branch, which outlives the tree, and a
+        // worktree left behind on an error path leaks a directory per run.
+        if let Some(wt) = &worktree {
+            if let Err(err) = repo::worktree_remove(wt) {
+                // Not fatal: the work is committed to a branch that is
+                // already durable. Report it and carry on rather than
+                // failing a run that actually succeeded.
+                eprintln!("warning: could not remove worktree: {err}");
+            }
+        }
+
+        match committed {
             Ok(Some(info)) => {
                 report.commit = Some(info.sha);
                 report.files_changed = info.files_changed;
@@ -197,6 +236,10 @@ fn run_cmd(sub: &clap::ArgMatches) -> ExitCode {
                 eprintln!("completed after {iterations} iteration(s)");
             }
             eprintln!("{summary}");
+            // Also carried in the stdout report: a supervisor reading only
+            // stdout should not have to scrape stderr to learn what the run
+            // says it did.
+            report.summary = Some(summary);
             finish(report, ExitCode::Completed, start)
         }
         LoopExit::ProviderError { reason, iterations } => {
