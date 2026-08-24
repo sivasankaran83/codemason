@@ -107,10 +107,3 @@ docker build -t codemason .
 docker run --rm -v /path/to/target/repo:/repo codemason \
   run --repo /repo --task "..." --model <id> --base-url <url> --api-key <key>
 ```
-
-**Not verified in this environment.** This development machine has neither
-Docker nor a registered WSL Linux distribution, so `docker build`/`docker run`
-and the resulting image size could not be exercised here. The `Dockerfile` is
-written to match the spec's shape and reviewed by inspection, but its build
-and run success is unconfirmed — verify on a Docker-capable machine before
-relying on it.
