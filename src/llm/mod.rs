@@ -2,7 +2,8 @@
 //! with exponential backoff and jitter; anything else is a single-shot
 //! failure. Never estimates a cost the provider didn't report.
 
-pub mod types;
+pub mod cache;
+mod types;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -54,9 +55,24 @@ impl Client {
         tools: &[ToolDef],
     ) -> Result<CompletionResult, Error> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+
+        // Serialising through `Value` first produces byte-identical JSON to
+        // the typed path; it exists so cache breakpoints can be applied to
+        // the messages that need them, for the models that need them. A model
+        // that caches on its own is sent exactly what it was sent before.
+        let wire: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+            .collect();
+        let wire = if cache::needs_explicit_breakpoints(model) {
+            cache::apply_breakpoints(wire)
+        } else {
+            wire
+        };
+
         let body = types::CompletionRequest {
             model,
-            messages,
+            messages: wire,
             tools,
             tool_choice: "auto",
             usage: types::UsageInclude { include: true },

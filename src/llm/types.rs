@@ -129,7 +129,7 @@ pub(crate) struct UsageInclude {
 #[derive(Debug, Serialize)]
 pub(crate) struct CompletionRequest<'a> {
     pub model: &'a str,
-    pub messages: &'a [ChatMessage],
+    pub messages: Vec<serde_json::Value>,
     pub tools: &'a [ToolDef],
     pub tool_choice: &'static str,
     pub usage: UsageInclude,
