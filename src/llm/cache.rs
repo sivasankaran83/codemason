@@ -18,6 +18,16 @@
 //! independence should not be quietly worse on one vendor because of a wire
 //! detail, which is what this module fixes.
 //!
+//! Measured again with breakpoints applied, same task, same iteration count:
+//!
+//! | | prompt tokens | cached | cost |
+//! |---|---|---|---|
+//! | `anthropic/claude-sonnet-5` before | 47,385 | 0 (0%) | $0.1029 |
+//! | `anthropic/claude-sonnet-5` after | 47,375 | 27,173 (57.4%) | **$0.0692** |
+//!
+//! A third off, and the hit rate now matches what the automatic providers
+//! reach on their own.
+//!
 //! ## Why the shape is delicate
 //!
 //! A breakpoint requires the message's `content` to become an array of typed
