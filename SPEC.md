@@ -722,8 +722,28 @@ from what goes on the wire:
 fetched again with one tool call. That is the difference between eliding and
 forgetting, and it is why this is not the thing the Must Not entry forbade.
 
-`--keep-recent-turns 0` disables it and restores the previous behaviour
-exactly.
+`--keep-recent-turns 0` disables it and **is the default**, on measurement
+that arrived after this amendment was first written.
+
+**Correction.** The amendment above reasoned that because history is 92% of
+prompt spend, sending less of it saves money. That is wrong: it counts bytes
+rather than cost. The repeated history *is* the provider's cache prefix, and
+cached tokens cost roughly a tenth of fresh ones. Eliding rewrites old
+messages, changes the prefix, and forfeits the discount. Measured against a
+real provider on an identical read-heavy task:
+
+| | prompt tokens | cached | cost |
+|---|---|---|---|
+| elision off | 59,972 | 35,825 (59.7%) | **$0.0124** |
+| elision on (keep 3) | 47,252 | 0 (0%) | $0.0154 |
+
+Fewer tokens, more money. The earlier 42% figure came from a deterministic
+stub with no caching, which measured bytes on the wire — the wrong quantity.
+
+Elision therefore stays, off by default, for the case it is genuinely good
+for: a conversation that would overflow the **context window**, where
+something must go and a recoverable placeholder beats a hard failure. It is
+not a cost optimisation.
 
 **Also added:** `cached_tokens` and `cache_discount` are now read from the
 provider's usage object when reported, and `cached_tokens` is recorded on each

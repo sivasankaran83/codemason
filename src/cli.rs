@@ -84,15 +84,17 @@ fn run_command() -> Command {
                 .long("worktree")
                 .action(ArgAction::SetTrue),
         )
-        // Context elision. History is re-sent whole on every call, so prompt
-        // spend grows quadratically with iteration count; on a measured
-        // 21-iteration run, 92% of the tokens billed were re-sent history.
-        // 0 disables it and restores the pre-amendment behaviour exactly.
+        // Context elision, OFF by default (0). Eliding shrinks the payload
+        // but changes the conversation prefix, which forfeits the provider's
+        // prompt cache — and cached tokens cost about a tenth of fresh ones.
+        // Measured: eliding sent 21% fewer tokens and cost 24% MORE. Use a
+        // non-zero value only when the context window is the binding
+        // constraint, never to save money. See `compact`.
         .arg(
             Arg::new("keep-recent-turns")
                 .long("keep-recent-turns")
                 .value_name("N")
-                .default_value("3"),
+                .default_value("0"),
         )
         .arg(
             Arg::new("allow-unlisted-model")

@@ -5,10 +5,18 @@
 //! Conversation history is append-only and re-sent whole on every call, so a
 //! run's prompt spend grows quadratically with its iteration count. Measured
 //! on a real 21-iteration run: 411,469 prompt tokens billed for a
-//! conversation whose final size was 33,678 — **92% of the spend was
-//! re-sending history**. Prompt caching recovers some of that (the same run
-//! came in at 0.71x list price) but caching is the provider's choice, not
-//! ours, and it does not shrink the context window.
+//! conversation whose final size was 33,678 — 92% of the spend was re-sending
+//! history.
+//!
+//! That looks like an argument for sending less. It is not, and this module
+//! is **off by default** as a result. Re-sent history is the provider's cache
+//! prefix, and cached tokens cost about a tenth of fresh ones; eliding
+//! rewrites old messages, changes that prefix, and forfeits the discount.
+//! Measured against a real provider on an identical task, eliding sent 21%
+//! fewer tokens and cost 24% more. See [`DEFAULT_KEEP_RECENT_TURNS`].
+//!
+//! What remains true is that elision shrinks the *context window*, which the
+//! cache does not. That is the case this exists for.
 //!
 //! SPEC.md's Must Not list forbids summarising or truncating conversation
 //! context, and that rule is right about the thing it was aimed at. A
@@ -34,10 +42,31 @@
 
 use crate::llm::ChatMessage;
 
-/// Tool results within this many of the most recent assistant turns are kept
-/// verbatim. Three is enough to cover read-then-edit-then-verify, which is
-/// the shortest sequence where the model genuinely needs the earlier result.
-pub const DEFAULT_KEEP_RECENT_TURNS: u32 = 3;
+/// Elision is **off by default**, on measurement.
+///
+/// The obvious reasoning — history is 92% of prompt spend, so send less of
+/// it — is wrong, because it counts bytes rather than money. Eliding rewrites
+/// old tool results, which changes the conversation prefix on every call, and
+/// a changed prefix cannot be served from the provider's prompt cache. Cached
+/// tokens cost roughly a tenth of fresh ones, so trading the cache for a
+/// smaller payload trades a ~90% discount for a ~20% one.
+///
+/// Measured on an identical read-heavy task against a real provider:
+///
+/// | | prompt tokens | cached | cost |
+/// |---|---|---|---|
+/// | elision off | 59,972 | 35,825 (59.7%) | **$0.0124** |
+/// | elision on (keep 3) | 47,252 | 0 (0%) | $0.0154 |
+///
+/// Fewer tokens, more money. An earlier A/B appeared to show a 42% saving,
+/// but it ran against a stub with no caching and measured bytes on the wire
+/// rather than what they cost — the wrong quantity.
+///
+/// So this exists for the case where the **context window**, not the bill, is
+/// the binding constraint: a conversation that would otherwise overflow. Then
+/// something must go, and a recoverable placeholder beats a hard failure. Set
+/// `--keep-recent-turns 3` deliberately for that; do not set it to save money.
+pub const DEFAULT_KEEP_RECENT_TURNS: u32 = 0;
 
 /// Below this, eliding costs more in explanation than it saves in tokens.
 const MIN_ELIDE_CHARS: usize = 400;
